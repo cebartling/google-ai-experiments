@@ -25,6 +25,9 @@ Usage (uv resolves and installs deps automatically, no venv needed):
 
     # or, if it's executable (chmod +x generate_video.py):
     ./generate_video.py "A drone flies through a canyon at sunset"
+
+    # longer prompts are easier to keep in a file:
+    uv run generate_video.py --prompt-file prompt.txt
 """
 
 import argparse
@@ -57,6 +60,29 @@ def load_env_file(env_path: Path) -> None:
             "Create it with a line reading GEMINI_API_KEY=your-api-key."
         )
     load_dotenv(env_path, override=False)
+
+
+def resolve_prompt(prompt: str | None, prompt_file: Path | None) -> str:
+    """Return the prompt text from either the inline argument or a file.
+
+    Exactly one source must be supplied. File content keeps its internal
+    line breaks; only surrounding whitespace is trimmed.
+    """
+    if prompt is not None and prompt_file is not None:
+        raise ValueError("Provide a prompt or --prompt-file, not both.")
+    if prompt is None and prompt_file is None:
+        raise ValueError("Provide a prompt argument or --prompt-file.")
+
+    if prompt is not None:
+        return prompt
+
+    if not prompt_file.is_file():
+        raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
+
+    text = prompt_file.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"Prompt file is empty: {prompt_file}")
+    return text
 
 
 def build_client() -> genai.Client:
@@ -129,7 +155,10 @@ def save_videos(client: genai.Client, operation, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate a video with Veo.")
-    parser.add_argument("prompt", help="Text prompt describing the video")
+    parser.add_argument("prompt", nargs="?",
+                         help="Text prompt describing the video")
+    parser.add_argument("--prompt-file", "-f", type=Path,
+                         help="Read the prompt from this text file instead")
     parser.add_argument("--model", default="veo-3.1-generate-preview",
                          help="Veo model ID (default: veo-3.1-generate-preview)")
     parser.add_argument("--aspect-ratio", default="16:9", choices=["16:9", "9:16"],
@@ -146,6 +175,11 @@ def main():
     args = parser.parse_args()
 
     try:
+        prompt = resolve_prompt(args.prompt, args.prompt_file)
+    except (ValueError, FileNotFoundError) as e:
+        parser.error(str(e))
+
+    try:
         load_env_file(ENV_FILE)
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -156,7 +190,7 @@ def main():
     print(f"Starting generation with {args.model}...", file=sys.stderr)
     try:
         operation = start_generation(
-            client, args.prompt, args.model, args.aspect_ratio, args.resolution
+            client, prompt, args.model, args.aspect_ratio, args.resolution
         )
     except Exception as e:
         print(f"Failed to start generation: {e}", file=sys.stderr)
