@@ -11,10 +11,10 @@
 Generate videos with Veo via the Gemini API SDK.
 
 Setup:
-    Create a .env.local file next to this script containing your
-    Google AI Studio key:
+    Copy the template next to this script and fill in your Google AI
+    Studio key:
 
-        GEMINI_API_KEY=your-api-key
+        cp .env.example .env.local
 
 Usage (uv resolves and installs deps automatically, no venv needed):
     uv run generate_video.py "A drone flies through a canyon at sunset" \
