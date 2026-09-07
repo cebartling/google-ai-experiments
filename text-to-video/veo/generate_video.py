@@ -4,13 +4,17 @@
 # dependencies = [
 #     "google-genai",
 #     "tenacity",
+#     "python-dotenv",
 # ]
 # ///
 """
 Generate videos with Veo via the Gemini API SDK.
 
 Setup:
-    export GEMINI_API_KEY="your-api-key"   # from Google AI Studio
+    Create a .env.local file next to this script containing your
+    Google AI Studio key:
+
+        GEMINI_API_KEY=your-api-key
 
 Usage (uv resolves and installs deps automatically, no venv needed):
     uv run generate_video.py "A drone flies through a canyon at sunset" \
@@ -26,7 +30,9 @@ Usage (uv resolves and installs deps automatically, no venv needed):
 import argparse
 import sys
 import time
+from pathlib import Path
 
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -34,6 +40,23 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 class VideoGenerationError(Exception):
     """Raised when Veo returns a terminal failure state."""
+
+
+ENV_FILE = Path(__file__).resolve().parent / ".env.local"
+
+
+def load_env_file(env_path: Path) -> None:
+    """Load environment variables from env_path.
+
+    Raises FileNotFoundError if the file is missing, so a misconfigured
+    checkout fails immediately instead of at the first API call.
+    """
+    if not env_path.is_file():
+        raise FileNotFoundError(
+            f"Environment file not found: {env_path}. "
+            "Create it with a line reading GEMINI_API_KEY=your-api-key."
+        )
+    load_dotenv(env_path, override=False)
 
 
 def build_client() -> genai.Client:
@@ -121,6 +144,12 @@ def main():
     parser.add_argument("--timeout-seconds", type=int, default=600,
                          help="Max seconds to wait before giving up")
     args = parser.parse_args()
+
+    try:
+        load_env_file(ENV_FILE)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     client = build_client()
 
