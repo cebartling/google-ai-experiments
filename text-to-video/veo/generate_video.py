@@ -39,11 +39,18 @@ Usage (uv resolves and installs deps automatically, no venv needed):
     ./generate_video.py "a candle flame flickers" --image frame.png --loop \
         --duration 8 --resolution 720p
 
+    # ...and crossfade the tail over the head to hide the remaining seam
+    # (needs ffmpeg; the clip comes out 0.5s shorter):
+    ./generate_video.py "a candle flame flickers" --image frame.png --loop \
+        --crossfade --duration 8 --resolution 720p
+
 See README.md for the full flag list and the constraints the API enforces.
 """
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -205,6 +212,144 @@ def resolve_loop_options(*, loop: bool, image: Path | None,
     return LoopOptions(image, negative_prompt or LOOP_NEGATIVE_PROMPT)
 
 
+CROSSFADE_DEFAULT_SECONDS = 0.5
+
+
+class CrossfadeError(Exception):
+    """Raised when the post-generation crossfade cannot be applied."""
+
+
+def validate_crossfade(*, crossfade: float | None, loop: bool,
+                        duration: int) -> None:
+    """Reject crossfade values that cannot produce a tighter loop."""
+    if crossfade is None:
+        return
+    if not loop:
+        raise ValueError("--crossfade tightens the seam that --loop creates, "
+                         "so it requires --loop.")
+    if crossfade <= 0:
+        raise ValueError(
+            f"--crossfade must be greater than zero, got {crossfade}."
+        )
+    if crossfade >= duration:
+        raise ValueError(
+            f"--crossfade must be shorter than the clip; got {crossfade} for "
+            f"a {duration}s clip."
+        )
+
+
+def format_seconds(value: float) -> str:
+    """Render a duration for a filtergraph without trailing zeros."""
+    return f"{value:g}"
+
+
+def build_crossfade_filter(*, clip_seconds: float, fade_seconds: float,
+                            has_audio: bool) -> str:
+    """Build the filtergraph that dissolves the clip's tail over its head.
+
+    --loop ends on the frame the clip started from, but Veo's final frame
+    drifts from that anchor, so the wrap still shows a step. Dissolving the
+    last `fade_seconds` over the opening `fade_seconds` hides it, at the cost
+    of making the clip `fade_seconds` shorter.
+    """
+    fade = format_seconds(fade_seconds)
+    keep = format_seconds(clip_seconds - fade_seconds)
+    end = format_seconds(clip_seconds)
+
+    graph = (
+        f"[0:v]trim=0:{keep},setpts=PTS-STARTPTS[main];"
+        f"[0:v]trim={keep}:{end},setpts=PTS-STARTPTS[tail];"
+        f"[main]split[m1][m2];"
+        f"[m1]trim=0:{fade},setpts=PTS-STARTPTS[head];"
+        f"[m2]trim=start={fade},setpts=PTS-STARTPTS[rest];"
+        # A is the head, B the tail. B dominates at T=0 so the wrap matches
+        # the frame the clip ended on, A by the time the fade is over.
+        f"[head][tail]blend=all_expr='A*(T/{fade})+B*(1-(T/{fade}))'[bl];"
+        f"[bl][rest]concat=n=2:v=1:a=0[vout]"
+    )
+    if not has_audio:
+        return graph
+
+    return graph + (
+        f";[0:a]atrim=0:{keep},asetpts=PTS-STARTPTS[amain];"
+        f"[0:a]atrim={keep}:{end},asetpts=PTS-STARTPTS,"
+        f"afade=t=out:st=0:d={fade}[atail];"
+        f"[amain]asplit[a1][a2];"
+        f"[a1]atrim=0:{fade},asetpts=PTS-STARTPTS,"
+        f"afade=t=in:st=0:d={fade}[ahead];"
+        f"[a2]atrim=start={fade},asetpts=PTS-STARTPTS[arest];"
+        # normalize=0: the two ramped halves already sum to full level.
+        f"[ahead][atail]amix=inputs=2:normalize=0[abl];"
+        f"[abl][arest]concat=n=2:v=0:a=1[aout]"
+    )
+
+
+def require_binary(name: str) -> str:
+    """Return the path to an ffmpeg-suite binary, or explain how to get it."""
+    path = shutil.which(name)
+    if path is None:
+        raise CrossfadeError(
+            f"{name} was not found on PATH; --crossfade needs it. "
+            f"Install it with 'brew install ffmpeg'."
+        )
+    return path
+
+
+def has_audio_stream(path: str) -> bool:
+    """Whether the file carries an audio stream, per ffprobe.
+
+    Veo returns audio, but a clip that lacks it would fail the graph on an
+    unresolved [0:a] label, so the audio half is built only when it applies.
+    """
+    result = subprocess.run(
+        [require_binary("ffprobe"), "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=index", "-of", "csv=p=0", path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise CrossfadeError(
+            f"ffprobe could not read {path}: {result.stderr.strip()}"
+        )
+    return bool(result.stdout.strip())
+
+
+def apply_crossfade(path: str, *, clip_seconds: float,
+                     fade_seconds: float) -> None:
+    """Rewrite the clip at `path` with its loop seam crossfaded.
+
+    The faded clip replaces the original only once ffmpeg succeeds, so a
+    failed fade leaves the generated video untouched.
+    """
+    ffmpeg = require_binary("ffmpeg")
+    has_audio = has_audio_stream(path)
+
+    source = Path(path)
+    target = source.with_suffix(f".crossfade{source.suffix}")
+
+    command = [
+        ffmpeg, "-y", "-loglevel", "error", "-i", str(source),
+        "-filter_complex", build_crossfade_filter(
+            clip_seconds=clip_seconds, fade_seconds=fade_seconds,
+            has_audio=has_audio,
+        ),
+        "-map", "[vout]",
+    ]
+    if has_audio:
+        command += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
+    command += [
+        "-c:v", "libx264", "-crf", "16", "-preset", "slow",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(target),
+    ]
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise CrossfadeError(f"ffmpeg failed: {result.stderr.strip()}")
+        target.replace(source)
+    finally:
+        target.unlink(missing_ok=True)
+
+
 def build_config(*, aspect_ratio: str, resolution: str, duration: int,
                   negative_prompt: str | None = None,
                   person_generation: str | None = None,
@@ -356,6 +501,13 @@ def main():
     parser.add_argument("--loop", action="store_true",
                          help="End on the starting frame to make the clip "
                               "loop; requires --image")
+    parser.add_argument("--crossfade", type=float, nargs="?",
+                         const=CROSSFADE_DEFAULT_SECONDS, metavar="SECONDS",
+                         help="After generating, dissolve this many seconds of "
+                              "the clip's tail over its head to hide the loop "
+                              "seam (default: "
+                              f"{CROSSFADE_DEFAULT_SECONDS}). Shortens the clip "
+                              "by that much; requires --loop")
     parser.add_argument("--aspect-ratio", default="16:9", choices=["16:9", "9:16"],
                          help="Landscape (16:9) or portrait (9:16)")
     parser.add_argument("--resolution", default="1080p",
@@ -387,6 +539,11 @@ def main():
             image=args.image,
             last_frame=args.last_frame,
             negative_prompt=args.negative_prompt,
+        )
+        validate_crossfade(
+            crossfade=args.crossfade,
+            loop=args.loop,
+            duration=args.duration,
         )
         validate_inputs(
             image=args.image,
@@ -422,6 +579,8 @@ def main():
         print(f"model: {args.model}")
         print(f"prompt: {prompt}")
         print(f"image: {args.image or '(none)'}")
+        if args.crossfade:
+            print(f"crossfade: {args.crossfade}s applied after download")
         # exclude_none keeps the output to what is actually being sent.
         payload = redact_image_bytes(config.model_dump(mode="json", exclude_none=True))
         print(json.dumps(payload, indent=2))
@@ -457,6 +616,21 @@ def main():
     except VideoGenerationError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if args.crossfade:
+        print(f"Crossfading {args.crossfade}s to close the loop seam...",
+              file=sys.stderr)
+        try:
+            for path in saved_paths:
+                apply_crossfade(path, clip_seconds=args.duration,
+                                fade_seconds=args.crossfade)
+        except CrossfadeError as e:
+            # The clips are already downloaded and intact; a failed fade is
+            # worth reporting but not worth discarding a paid generation over.
+            print(f"Error: {e}", file=sys.stderr)
+            for path in saved_paths:
+                print(f"Saved without crossfade: {path}")
+            sys.exit(1)
 
     for path in saved_paths:
         print(f"Saved: {path}")

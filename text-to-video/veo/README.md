@@ -11,6 +11,8 @@ there is no venv to create.
   header inside the script and resolved on first run.
 - Python 3.10 or newer, which uv will fetch if you don't have it.
 - A Gemini API key with billing enabled.
+- `ffmpeg` (with `ffprobe`) on `PATH` — only for `--crossfade`; nothing
+  else in the script needs it.
 
 ## Setup
 
@@ -65,6 +67,7 @@ piped somewhere useful.
 | `--last-frame` | Still to end on; requires `--image` |
 | `--reference-image PATH:TYPE` | Up to three refs, `asset` or `style` |
 | `--loop` | End on the starting frame; requires `--image` |
+| `--crossfade [SECONDS]` | Dissolve the tail over the head to hide the seam (default 0.5); requires `--loop` |
 | `--duration {4,6,8}` | Clip length in seconds (default 8) |
 | `--person-generation` | `dont_allow`, `allow_adult`, `allow_all` |
 | `--aspect-ratio`, `--resolution` | `16:9`/`9:16`, `720p`/`1080p`/`4k` |
@@ -146,6 +149,37 @@ ffmpeg -i last.png -i first.png -lavfi psnr -f null -
 
 If the seam scores materially *worse* than the adjacent-frame baseline, it will
 read as a visible jump.
+
+#### Tightening the seam with `--crossfade`
+
+`--loop` alone usually leaves a visible hitch: Veo's final frame drifts from
+the anchor even with the negative prompt suppressing camera motion — typically
+the framing pulls slightly wider. `--crossfade` closes that gap after the
+download by dissolving the clip's last half-second over its first half-second,
+so the wrap is a blend rather than a cut.
+
+```bash
+./generate_video.py "a candle flame flickers in a dark room" \
+    --image frame.png --loop --crossfade --duration 8 --resolution 720p
+```
+
+Pass a value to change the fade length: `--crossfade 0.75`. Round trips
+cleanly when the fade is a whole number of frames — Veo returns 24 fps, so
+0.5 s is 12 frames.
+
+Two things to know:
+
+- **The clip gets shorter by the fade length.** An 8-second generation with
+  `--crossfade 0.5` lands as a 7.5-second file. That is inherent: the tail is
+  consumed by the dissolve rather than played.
+- **The audio is faded to match** (`afade` in/out summed at `normalize=0`, so
+  the level does not dip through the blend), which softens — but does not
+  remove — the audio seam noted above. Strip it if it still distracts.
+
+Measured on one 8-second clip, the seam's mean luma difference went from 32.5
+to 14.4, against an adjacent-frame baseline of 23.4 — i.e. from a step larger
+than ordinary motion to one smaller than it. The clip re-encodes at CRF 16,
+and the original is only replaced once ffmpeg succeeds.
 
 Longer loops are not directly supported. The API's video-extension feature
 (+7 s per call) is the other lever, and is not wired into this script.
