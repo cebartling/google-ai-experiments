@@ -496,3 +496,62 @@ def test_apply_crossfade_raises_when_ffmpeg_fails(tmp_path, monkeypatch):
 
     # The original clip survives a failed fade.
     assert clip.read_bytes() == b"original"
+
+
+# --- estimate_cost_usd -----------------------------------------------------
+
+def test_estimate_cost_usd_prices_standard_veo_at_forty_cents_a_second():
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-generate-preview", resolution="1080p", duration=8,
+    )
+
+    assert cost == pytest.approx(3.20)
+
+
+def test_estimate_cost_usd_charges_more_for_standard_at_4k():
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-generate-preview", resolution="4k", duration=8,
+    )
+
+    assert cost == pytest.approx(4.80)
+
+
+@pytest.mark.parametrize("resolution,expected", [
+    ("720p", 0.80),
+    ("1080p", 0.96),
+    ("4k", 2.40),
+])
+def test_estimate_cost_usd_prices_fast_by_resolution(resolution, expected):
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-fast-generate-preview", resolution=resolution, duration=8,
+    )
+
+    assert cost == pytest.approx(expected)
+
+
+def test_estimate_cost_usd_prices_lite_below_fast():
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-lite-generate-preview", resolution="720p", duration=8,
+    )
+
+    assert cost == pytest.approx(0.40)
+
+
+def test_estimate_cost_usd_scales_with_duration():
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-lite-generate-preview", resolution="720p", duration=4,
+    )
+
+    assert cost == pytest.approx(0.20)
+
+
+def test_estimate_cost_usd_returns_none_for_an_unknown_model():
+    assert generate_video.estimate_cost_usd(
+        model="veo-9-imaginary", resolution="1080p", duration=8,
+    ) is None
+
+
+def test_estimate_cost_usd_returns_none_for_a_resolution_the_model_does_not_support():
+    assert generate_video.estimate_cost_usd(
+        model="veo-3.1-lite-generate-preview", resolution="4k", duration=8,
+    ) is None

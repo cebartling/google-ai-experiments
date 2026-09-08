@@ -399,6 +399,34 @@ def redact_image_bytes(payload):
     return payload
 
 
+# Published Veo prices, in US dollars per second of generated video, from
+# https://ai.google.dev/gemini-api/docs/pricing (paid tier, video with audio,
+# which is the only mode this script can request). A model or resolution that
+# is absent here simply cannot be priced locally.
+VEO_PRICE_PER_SECOND_USD = {
+    "veo-3.1-generate-preview": {"720p": 0.40, "1080p": 0.40, "4k": 0.60},
+    "veo-3.1-fast-generate-preview": {"720p": 0.10, "1080p": 0.12, "4k": 0.30},
+    "veo-3.1-lite-generate-preview": {"720p": 0.05, "1080p": 0.08},
+}
+
+
+def estimate_cost_usd(*, model: str, resolution: str,
+                      duration: int) -> float | None:
+    """What this request will cost, or None if it cannot be priced.
+
+    --model takes an arbitrary string and prices change, so an unrecognised
+    model or resolution returns None rather than guessing. Callers must treat
+    None as "unknown" and let the request through.
+    """
+    rates = VEO_PRICE_PER_SECOND_USD.get(model)
+    if rates is None:
+        return None
+    rate = rates.get(resolution)
+    if rate is None:
+        return None
+    return rate * duration
+
+
 def is_transient_error(exc: BaseException) -> bool:
     """Whether a failed request is worth retrying.
 
