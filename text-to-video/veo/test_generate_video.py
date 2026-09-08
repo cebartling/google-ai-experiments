@@ -213,6 +213,21 @@ def test_validate_inputs_requires_eight_seconds_with_reference_images():
         ))
 
 
+def test_validate_inputs_requires_eight_seconds_for_interpolation():
+    with pytest.raises(ValueError, match="8"):
+        generate_video.validate_inputs(**valid_inputs(
+            image=Path("a.png"), last_frame=Path("a.png"),
+            duration=4, resolution="720p",
+        ))
+
+
+def test_validate_inputs_allows_interpolation_at_eight_seconds():
+    generate_video.validate_inputs(**valid_inputs(
+        image=Path("a.png"), last_frame=Path("a.png"),
+        duration=8, resolution="720p",
+    ))
+
+
 # --- resolve_loop_options --------------------------------------------------
 
 
@@ -224,7 +239,6 @@ def test_resolve_loop_options_passes_values_through_when_not_looping():
 
     assert options.last_frame == Path("b.png")
     assert options.negative_prompt == "rain"
-    assert options.enhance_prompt is None
 
 
 def test_resolve_loop_options_reuses_the_start_image_as_the_last_frame():
@@ -234,7 +248,6 @@ def test_resolve_loop_options_reuses_the_start_image_as_the_last_frame():
 
     assert options.last_frame == Path("a.png")
     assert options.negative_prompt == generate_video.LOOP_NEGATIVE_PROMPT
-    assert options.enhance_prompt is False
 
 
 def test_resolve_loop_options_keeps_an_explicit_negative_prompt():
@@ -273,10 +286,11 @@ def test_build_config_sets_only_the_supplied_fields():
     assert config.resolution == "1080p"
     assert config.duration_seconds == 8
     assert config.negative_prompt is None
-    assert config.seed is None
     assert config.person_generation is None
     assert config.last_frame is None
     assert config.reference_images is None
+    # Never set: the API rejects these on the Gemini Developer API.
+    assert config.seed is None
     assert config.enhance_prompt is None
     assert config.generate_audio is None
 
@@ -287,17 +301,14 @@ def test_build_config_maps_every_optional_field():
     )
 
     config = generate_video.build_config(
-        aspect_ratio="9:16", resolution="720p", duration=4,
-        negative_prompt="rain", seed=42, person_generation="dont_allow",
-        last_frame=last_frame, enhance_prompt=False, generate_audio=False,
+        aspect_ratio="9:16", resolution="720p", duration=8,
+        negative_prompt="rain", person_generation="dont_allow",
+        last_frame=last_frame,
     )
 
     assert config.negative_prompt == "rain"
-    assert config.seed == 42
     assert config.person_generation == "dont_allow"
     assert config.last_frame is last_frame
-    assert config.enhance_prompt is False
-    assert config.generate_audio is False
 
 
 def test_build_config_wraps_reference_images_with_their_types():
