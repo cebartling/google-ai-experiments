@@ -16,3 +16,13 @@ bin-release/
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
+
+# Local environment files
+text-to-video/veo/.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Generated video output
+*.mp4
