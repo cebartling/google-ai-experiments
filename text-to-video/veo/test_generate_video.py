@@ -496,3 +496,72 @@ def test_apply_crossfade_raises_when_ffmpeg_fails(tmp_path, monkeypatch):
 
     # The original clip survives a failed fade.
     assert clip.read_bytes() == b"original"
+
+
+# --- expected_person_generation --------------------------------------------
+
+
+def test_expected_person_generation_is_allow_all_for_text_to_video():
+    assert generate_video.expected_person_generation(
+        image=None, reference_images=[],
+    ) == "allow_all"
+
+
+def test_expected_person_generation_is_allow_adult_with_a_start_image():
+    assert generate_video.expected_person_generation(
+        image=Path("frame.png"), reference_images=[],
+    ) == "allow_adult"
+
+
+def test_expected_person_generation_is_allow_adult_with_reference_images():
+    assert generate_video.expected_person_generation(
+        image=None, reference_images=[(Path("dress.png"), "asset")],
+    ) == "allow_adult"
+
+
+# --- check_person_generation -----------------------------------------------
+
+
+def test_check_person_generation_is_quiet_when_unset():
+    assert generate_video.check_person_generation(
+        person_generation=None, image=None, reference_images=[],
+    ) is None
+
+
+def test_check_person_generation_is_quiet_when_it_matches_the_mode():
+    assert generate_video.check_person_generation(
+        person_generation="allow_all", image=None, reference_images=[],
+    ) is None
+    assert generate_video.check_person_generation(
+        person_generation="allow_adult", image=Path("a.png"), reference_images=[],
+    ) is None
+
+
+def test_check_person_generation_warns_on_allow_adult_for_text_to_video():
+    # The combination that returned "allow_adult for personGeneration is
+    # currently not supported" from the live API.
+    warning = generate_video.check_person_generation(
+        person_generation="allow_adult", image=None, reference_images=[],
+    )
+
+    assert warning is not None
+    assert "allow_all" in warning
+
+
+def test_check_person_generation_warns_on_allow_all_for_image_to_video():
+    warning = generate_video.check_person_generation(
+        person_generation="allow_all", image=Path("a.png"), reference_images=[],
+    )
+
+    assert warning is not None
+    assert "allow_adult" in warning
+
+
+def test_check_person_generation_mentions_the_regional_exception():
+    # It stays a warning rather than an error because EU/UK/CH/MENA accept
+    # only allow_adult, which would make this exact request correct there.
+    warning = generate_video.check_person_generation(
+        person_generation="allow_adult", image=None, reference_images=[],
+    )
+
+    assert "EU" in warning

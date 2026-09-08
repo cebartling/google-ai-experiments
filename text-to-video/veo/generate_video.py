@@ -212,6 +212,61 @@ def resolve_loop_options(*, loop: bool, image: Path | None,
     return LoopOptions(image, negative_prompt or LOOP_NEGATIVE_PROMPT)
 
 
+# Veo 3.1 accepts exactly one personGeneration value per generation mode, and
+# it is not the same one — per the parameter table at
+# ai.google.dev/gemini-api/docs/veo:
+#
+#   text-to-video, extension                      -> allow_all
+#   image-to-video, interpolation, reference imgs -> allow_adult
+#
+# Sending the other one is what returns "allow_adult for personGeneration is
+# currently not supported". `dont_allow` is in the SDK's PersonGeneration enum
+# but appears in neither list, so it is not offered.
+PERSON_GENERATION_TEXT_TO_VIDEO = "allow_all"
+PERSON_GENERATION_IMAGE_DRIVEN = "allow_adult"
+
+
+def expected_person_generation(*, image: Path | None,
+                                reference_images: list) -> str:
+    """The one personGeneration value Veo documents for this request's mode."""
+    if image is not None or reference_images:
+        return PERSON_GENERATION_IMAGE_DRIVEN
+    return PERSON_GENERATION_TEXT_TO_VIDEO
+
+
+def check_person_generation(*, person_generation: str | None,
+                             image: Path | None,
+                             reference_images: list) -> str | None:
+    """Return a warning when the value contradicts the mode's documented one.
+
+    A warning rather than a hard error: the docs also state that in EU, UK, CH
+    and MENA locations allow_adult is the only accepted value for
+    personGeneration, which makes a text-to-video request that looks wrong
+    from here the only correct one there. A rejected request costs nothing, so
+    the API gets the final say — this only makes the likely cause obvious
+    before the round trip.
+    """
+    if person_generation is None:
+        return None
+
+    expected = expected_person_generation(
+        image=image, reference_images=reference_images,
+    )
+    if person_generation == expected:
+        return None
+
+    mode = ("image-driven generation (image, interpolation or reference "
+            "images)" if expected == PERSON_GENERATION_IMAGE_DRIVEN
+            else "text-to-video")
+    return (
+        f"Warning: Veo documents {expected!r} as the only person-generation "
+        f"value for {mode}, but {person_generation!r} was given; the API will "
+        f"most likely reject this request. (In EU, UK, CH and MENA locations "
+        f"'allow_adult' is the only accepted value for any mode, so this may "
+        f"be correct there — sending it anyway.)"
+    )
+
+
 CROSSFADE_DEFAULT_SECONDS = 0.5
 
 
@@ -517,8 +572,14 @@ def main():
                          help="Clip length in seconds. Must be 8 above 720p "
                               "or with reference images")
     parser.add_argument("--person-generation",
-                         choices=["dont_allow", "allow_adult", "allow_all"],
-                         help="Whether people may be generated")
+                         choices=[PERSON_GENERATION_TEXT_TO_VIDEO,
+                                  PERSON_GENERATION_IMAGE_DRIVEN],
+                         help="Whether people may be generated. Veo allows "
+                              f"only {PERSON_GENERATION_TEXT_TO_VIDEO!r} for "
+                              "text-to-video and only "
+                              f"{PERSON_GENERATION_IMAGE_DRIVEN!r} when an "
+                              "image or reference image is supplied, so the "
+                              "API default is usually the right choice")
     parser.add_argument("--output", default="output.mp4",
                          help="File path to save the generated video to")
     parser.add_argument("--poll-seconds", type=int, default=10,
@@ -554,6 +615,14 @@ def main():
         )
     except (ValueError, FileNotFoundError) as e:
         parser.error(str(e))
+
+    person_generation_warning = check_person_generation(
+        person_generation=args.person_generation,
+        image=args.image,
+        reference_images=reference_images,
+    )
+    if person_generation_warning:
+        print(person_generation_warning, file=sys.stderr)
 
     try:
         image = load_image(args.image) if args.image else None
