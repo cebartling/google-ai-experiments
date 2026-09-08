@@ -4,6 +4,14 @@
 [uv](https://docs.astral.sh/uv/) script — dependencies are declared inline, so
 there is no venv to create.
 
+## Requirements
+
+- [uv](https://docs.astral.sh/uv/) — the only thing to install. Dependencies
+  (`google-genai`, `tenacity`, `python-dotenv`) are declared in a PEP 723
+  header inside the script and resolved on first run.
+- Python 3.10 or newer, which uv will fetch if you don't have it.
+- A Gemini API key with billing enabled.
+
 ## Setup
 
 ```bash
@@ -11,8 +19,13 @@ cp .env.example .env.local   # then fill in GEMINI_API_KEY
 chmod +x generate_video.py
 ```
 
-The key comes from <https://aistudio.google.com/apikey>. Every generation is
-billed, so use `--dry-run` while you are still working out the flags.
+The key comes from <https://aistudio.google.com/apikey>, and `.env.local` is
+gitignored. The script looks for it next to itself, not in the working
+directory, so it runs correctly from anywhere; a missing file is a hard error
+before any request is made.
+
+Every generation is billed, so use `--dry-run` while you are still working out
+the flags.
 
 ## Usage
 
@@ -22,6 +35,25 @@ billed, so use `--dry-run` while you are still working out the flags.
 ```
 
 Run the tests with `uv run test_generate_video.py`.
+
+## How a run proceeds
+
+Video generation is a long-running operation, so a run is three phases and
+takes minutes, not seconds:
+
+1. **Kick off.** The request returns an operation handle immediately. Transient
+   failures — HTTP 5xx and 429 rate limits — are retried up to five times with
+   exponential backoff. Anything else (a bad key, a rejected argument) fails
+   straight away rather than being retried.
+2. **Poll.** The script checks the operation every `--poll-seconds` and prints
+   elapsed time to stderr, giving up at `--timeout-seconds`. Google documents
+   latency of 11 seconds to 6 minutes, so the 600 s default has room but a
+   generation that hits the ceiling during peak hours will need it raised.
+3. **Download.** The finished video is fetched and written to `--output`, which
+   is **overwritten without warning** if it already exists.
+
+Progress goes to stderr and the saved path to stdout, so `--output` paths can be
+piped somewhere useful.
 
 ## Flags
 
@@ -39,6 +71,12 @@ Run the tests with `uv run test_generate_video.py`.
 | `--no-audio` | Drop the generated soundtrack |
 | `--aspect-ratio`, `--resolution` | `16:9`/`9:16`, `720p`/`1080p`/`4k` |
 | `--dry-run` | Print the resolved request and exit; no API call |
+| `--model` | Veo model ID (default `veo-3.1-generate-preview`) |
+| `--output` | Where to write the `.mp4` (default `output.mp4`) |
+| `--poll-seconds` | Seconds between status checks (default 10) |
+| `--timeout-seconds` | Give up after this long (default 600) |
+
+`--help` prints the same list with the exact choices for each flag.
 
 ### Negative prompts
 
@@ -114,3 +152,25 @@ output is SynthID-watermarked.
 Model support varies (`4k` is Veo 3.1 / 3.1 Fast only, not Lite or Veo 3), and
 `--model` takes an arbitrary string, so that combination is left to the API to
 validate.
+
+
+## Troubleshooting
+
+**"Environment file not found"** — `.env.local` doesn't exist next to the
+script. Copy `.env.example` onto it.
+
+**A flag combination is rejected before anything happens.** That is the local
+validation doing its job; the message names the rule. Nothing was billed.
+
+**The same prompt and `--seed` gave different videos.** Prompt enhancement
+rewrites your prompt before generation and defaults to on, which voids seed
+reproducibility. `--loop` turns it off; there is currently no standalone flag
+to do so on other paths.
+
+**A generation was blocked.** Veo runs safety filters over the audio as well as
+the video and will sometimes block on the audio alone. Blocked generations are
+not charged. `--no-audio` avoids that class of failure entirely.
+
+**The video URL 404s a few days later.** Generated videos are deleted from the
+server after 2 days. The script downloads immediately, so this only bites if
+you are reusing an old operation.
