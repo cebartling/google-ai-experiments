@@ -26,3 +26,6 @@ __pycache__/
 
 # Generated video output
 *.mp4
+
+# macOS
+.DS_Store
