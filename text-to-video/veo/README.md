@@ -76,10 +76,11 @@ Run the tests with `uv run test_generate_video.py`.
 Video generation is a long-running operation, so a run is three phases and
 takes minutes, not seconds:
 
-1. **Kick off.** The request returns an operation handle immediately. Transient
-   failures — HTTP 5xx and 429 rate limits — are retried up to five times with
-   exponential backoff. Anything else (a bad key, a rejected argument) fails
-   straight away rather than being retried.
+1. **Kick off.** The request returns an operation handle immediately. HTTP 5xx
+   is retried up to five times with exponential backoff. A 429 rate limit gets
+   only **two** attempts, and none at all when the error names a per-day quota
+   — see below. Anything else (a bad key, a rejected argument) fails straight
+   away rather than being retried.
 2. **Poll.** The script checks the operation every `--poll-seconds` and prints
    elapsed time to stderr, giving up at `--timeout-seconds`. Google documents
    latency of 11 seconds to 6 minutes, so the 600 s default has room but a
@@ -89,6 +90,21 @@ takes minutes, not seconds:
 
 Progress goes to stderr and the saved path to stdout, so `--output` paths can be
 piped somewhere useful.
+
+### Why 429s get a shorter leash
+
+A 429 is two different failures wearing the same status code. A per-minute
+limit clears in seconds and is worth retrying. A per-day quota does not clear
+until midnight Pacific, and **every retry spends another request from the quota
+that is already exhausted** — costly when Veo allows only 10 requests a day on
+Tier 1, where five attempts can burn half a day's budget chasing a limit no
+amount of waiting will lift.
+
+The API does not reliably distinguish them. Google *sometimes* includes a
+`QuotaFailure` detail naming the violated quota, and when it names a per-day
+one the script does not retry at all. When the detail is absent — as it often
+is — the script falls back to two attempts rather than five: enough to ride out
+a per-minute limit, cheap enough to be wrong about.
 
 ## Flags
 

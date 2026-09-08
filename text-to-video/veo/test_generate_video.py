@@ -828,3 +828,103 @@ def test_spend_preflight_error_says_waiting_cannot_help_when_the_cost_exceeds_th
 
     assert "waiting will not help" in message
     assert "--force-spend" in message
+
+
+# --- is_daily_quota_error --------------------------------------------------
+
+def rate_limit_error(*violations):
+    """A 429 carrying the QuotaFailure detail Google sometimes includes."""
+    body = {"error": {"code": 429, "message": "You exceeded your current quota.",
+                      "status": "RESOURCE_EXHAUSTED"}}
+    if violations:
+        body["error"]["details"] = [{
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            "violations": [{"quotaId": quota_id} for quota_id in violations],
+        }]
+    return errors.ClientError(429, body)
+
+
+def test_is_daily_quota_error_detects_a_per_day_violation():
+    exc = rate_limit_error("GenerateRequestsPerDayPerProjectPerModel")
+
+    assert generate_video.is_daily_quota_error(exc) is True
+
+
+def test_is_daily_quota_error_ignores_a_per_minute_violation():
+    exc = rate_limit_error("GenerateRequestsPerMinutePerProjectPerModel")
+
+    assert generate_video.is_daily_quota_error(exc) is False
+
+
+def test_is_daily_quota_error_detects_a_per_day_violation_among_others():
+    exc = rate_limit_error("GenerateRequestsPerMinutePerProjectPerModel",
+                           "GenerateRequestsPerDayPerProjectPerModel")
+
+    assert generate_video.is_daily_quota_error(exc) is True
+
+
+def test_is_daily_quota_error_is_false_when_the_error_names_no_quota():
+    assert generate_video.is_daily_quota_error(rate_limit_error()) is False
+
+
+def test_is_daily_quota_error_is_false_for_a_non_rate_limit_error():
+    assert generate_video.is_daily_quota_error(errors.ClientError(400, {})) is False
+
+
+def test_is_daily_quota_error_is_false_for_an_arbitrary_exception():
+    assert generate_video.is_daily_quota_error(ValueError("bad flag")) is False
+
+
+# --- is_transient_error, daily quotas --------------------------------------
+
+def test_is_transient_error_does_not_retry_an_exhausted_daily_quota():
+    exc = rate_limit_error("GenerateRequestsPerDayPerProjectPerModel")
+
+    assert generate_video.is_transient_error(exc) is False
+
+
+def test_is_transient_error_still_retries_a_per_minute_rate_limit():
+    exc = rate_limit_error("GenerateRequestsPerMinutePerProjectPerModel")
+
+    assert generate_video.is_transient_error(exc) is True
+
+
+# --- stop_after_transient_attempts -----------------------------------------
+
+class FakeOutcome:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def exception(self):
+        return self._exc
+
+
+class FakeRetryState:
+    def __init__(self, exc, attempt_number):
+        self.outcome = FakeOutcome(exc)
+        self.attempt_number = attempt_number
+
+
+def test_stop_after_transient_attempts_gives_server_errors_five_tries():
+    exc = errors.ServerError(503, {})
+
+    assert generate_video.stop_after_transient_attempts(
+        FakeRetryState(exc, 4)) is False
+    assert generate_video.stop_after_transient_attempts(
+        FakeRetryState(exc, 5)) is True
+
+
+def test_stop_after_transient_attempts_gives_rate_limits_a_shorter_leash():
+    exc = rate_limit_error()
+
+    assert generate_video.stop_after_transient_attempts(
+        FakeRetryState(exc, 1)) is False
+    assert generate_video.stop_after_transient_attempts(
+        FakeRetryState(exc, 2)) is True
+
+
+def test_stop_after_transient_attempts_stops_when_there_is_no_outcome():
+    state = FakeRetryState(errors.ServerError(503, {}), 1)
+    state.outcome = None
+
+    assert generate_video.stop_after_transient_attempts(state) is False

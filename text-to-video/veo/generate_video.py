@@ -61,7 +61,7 @@ from typing import NamedTuple
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, wait_exponential
 
 
 class VideoGenerationError(Exception):
@@ -575,17 +575,59 @@ def spend_preflight_error(*, cost_usd: float | None, entries: list[dict],
     )
 
 
+# A server error may clear on the next attempt, so it is worth several. A 429
+# is different: it may be a per-minute limit that clears in seconds, or a
+# per-day quota that will not clear today at all, and every retry of the latter
+# spends another request from the quota that is already exhausted. Veo allows
+# only 10 requests a day on Tier 1, so five attempts can burn half a day's
+# budget chasing a limit no amount of waiting will lift.
+MAX_ATTEMPTS = 5
+MAX_RATE_LIMIT_ATTEMPTS = 2
+
+
+def is_daily_quota_error(exc: BaseException) -> bool:
+    """Whether a 429 names a per-day quota, which retrying cannot clear.
+
+    Google includes a QuotaFailure detail naming the violated quota only
+    sometimes, so an absent or unrecognised detail returns False and the
+    request keeps its (short) retry budget.
+    """
+    if not isinstance(exc, errors.APIError) or exc.code != 429:
+        return False
+    details = exc.details if isinstance(exc.details, dict) else {}
+    for detail in details.get("error", {}).get("details", []) or []:
+        if not isinstance(detail, dict):
+            continue
+        for violation in detail.get("violations", []) or []:
+            if not isinstance(violation, dict):
+                continue
+            if "perday" in str(violation.get("quotaId", "")).lower():
+                return True
+    return False
+
+
 def is_transient_error(exc: BaseException) -> bool:
     """Whether a failed request is worth retrying.
 
     Server errors and rate limits are; a rejected argument or a bad key will
-    be rejected just as fast on the fifth attempt as on the first.
+    be rejected just as fast on the fifth attempt as on the first. An
+    exhausted daily quota is not worth retrying either, and retrying it makes
+    things worse by spending more of the quota.
     """
     if isinstance(exc, errors.ServerError):
         return True
-    if isinstance(exc, errors.APIError):
-        return exc.code == 429
+    if isinstance(exc, errors.APIError) and exc.code == 429:
+        return not is_daily_quota_error(exc)
     return False
+
+
+def stop_after_transient_attempts(retry_state) -> bool:
+    """Stop retrying, giving rate limits a shorter leash than server errors."""
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    limit = (MAX_RATE_LIMIT_ATTEMPTS
+             if isinstance(exc, errors.APIError) and exc.code == 429
+             else MAX_ATTEMPTS)
+    return retry_state.attempt_number >= limit
 
 
 def build_client() -> genai.Client:
@@ -597,7 +639,7 @@ def build_client() -> genai.Client:
 @retry(
     retry=retry_if_exception(is_transient_error),
     wait=wait_exponential(multiplier=2, min=4, max=60),
-    stop=stop_after_attempt(5),
+    stop=stop_after_transient_attempts,
     reraise=True,
 )
 def start_generation(client: genai.Client, prompt: str, model: str,
