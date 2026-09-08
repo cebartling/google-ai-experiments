@@ -66,9 +66,7 @@ piped somewhere useful.
 | `--reference-image PATH:TYPE` | Up to three refs, `asset` or `style` |
 | `--loop` | End on the starting frame; requires `--image` |
 | `--duration {4,6,8}` | Clip length in seconds (default 8) |
-| `--seed` | Fixed seed for reproducible output |
 | `--person-generation` | `dont_allow`, `allow_adult`, `allow_all` |
-| `--no-audio` | Drop the generated soundtrack |
 | `--aspect-ratio`, `--resolution` | `16:9`/`9:16`, `720p`/`1080p`/`4k` |
 | `--dry-run` | Print the resolved request and exit; no API call |
 | `--model` | Veo model ID (default `veo-3.1-generate-preview`) |
@@ -112,12 +110,16 @@ Images must be PNG or JPEG.
 Veo has no loop parameter. `--loop` builds one out of the parts that exist: it
 passes `--image` as the last frame too, so the clip ends where it began, and
 sets a negative prompt against the drift that would give the seam away
-(camera movement, cuts, fades). It also disables prompt enhancement, which
-otherwise rewrites the prompt and voids `--seed` reproducibility.
+(camera movement, cuts, fades).
+
+**Interpolation is locked to 8 seconds.** Passing `--last-frame` (which `--loop`
+does) with `--duration 4` or `6` is rejected by the API as *"Your use case is
+currently not supported"*. This is not in Google's documentation — it was
+established by probing the live API — so the script now rejects it locally.
 
 ```bash
 ./generate_video.py "a candle flame flickers in a dark room" \
-    --image frame.png --loop --duration 4 --resolution 720p --seed 42 --no-audio
+    --image frame.png --loop --duration 8 --resolution 720p
 ```
 
 What makes the seam hold up:
@@ -125,12 +127,25 @@ What makes the seam hold up:
 - Prompt **cyclical motion**, not a narrative arc — rippling water, drifting
   steam, an object completing one full rotation. Anything that ends somewhere
   different from where it started will fight the constraint.
-- Keep it **short** (`--duration 4`); there is less room to wander.
-- Pass **`--no-audio`**; the soundtrack does not loop cleanly even when the
-  picture does.
+- 8 seconds is a lot of time to drift, and you cannot ask for less. Favour
+  scenes whose motion is genuinely repetitive over a long beat.
+- **Strip the audio afterwards** — it cannot be disabled at generation time
+  (see below) and does not loop cleanly even when the picture does:
+  `ffmpeg -i in.mp4 -c copy -an out.mp4`.
 - Supply your own `--negative-prompt` to override the built-in one if your
   scene needs different suppressions — `--loop` only fills it in when you
   haven't.
+
+Verify a seam objectively rather than trusting your eye — compare the last
+frame against the first, and check that difference against two adjacent
+mid-clip frames as a baseline:
+
+```bash
+ffmpeg -i last.png -i first.png -lavfi psnr -f null -
+```
+
+If the seam scores materially *worse* than the adjacent-frame baseline, it will
+read as a visible jump.
 
 Longer loops are not directly supported. The API's video-extension feature
 (+7 s per call) is the other lever, and is not wired into this script.
@@ -143,7 +158,7 @@ These are checked locally, before any request is sent:
 | --- | --- |
 | `--last-frame` | Only valid alongside `--image` |
 | `--reference-image` | Max 3; cannot combine with `--image` |
-| `--duration` | Must be `8` at `1080p` or `4k`, and with reference images |
+| `--duration` | Must be `8` at `1080p` or `4k`, with reference images, and with `--last-frame` |
 
 Also worth knowing: output is 24 fps, one video per request, and generated
 videos are deleted from the server after **2 days** — download promptly. All
@@ -162,15 +177,29 @@ script. Copy `.env.example` onto it.
 **A flag combination is rejected before anything happens.** That is the local
 validation doing its job; the message names the rule. Nothing was billed.
 
-**The same prompt and `--seed` gave different videos.** Prompt enhancement
-rewrites your prompt before generation and defaults to on, which voids seed
-reproducibility. `--loop` turns it off; there is currently no standalone flag
-to do so on other paths.
+**Generations are not reproducible.** There is no seed. `seed` exists in the
+API but the SDK rejects it outside Vertex AI, so repeated runs of an identical
+command return different videos.
 
 **A generation was blocked.** Veo runs safety filters over the audio as well as
 the video and will sometimes block on the audio alone. Blocked generations are
-not charged. `--no-audio` avoids that class of failure entirely.
+not charged.
 
 **The video URL 404s a few days later.** Generated videos are deleted from the
 server after 2 days. The script downloads immediately, so this only bites if
 you are reusing an old operation.
+
+## Not available on this API surface
+
+The script talks to the **Gemini Developer API** (an AI Studio key). These
+`GenerateVideosConfig` fields exist in the SDK but are rejected outside Vertex
+AI, so the script does not expose them: `seed`, `generate_audio`, `fps`,
+`output_gcs_uri`, `pubsub_topic`, `mask`, `compression_quality`, `labels`,
+`resize_mode`.
+
+Separately, `enhance_prompt` is rejected by `veo-3.1-generate-preview` itself
+(*"`enhancePrompt` isn't supported by this model"*), so it is never set.
+
+The practical consequences: **no reproducible seeds**, and **audio cannot be
+turned off at generation time** — strip it afterwards with
+`ffmpeg -i in.mp4 -c copy -an out.mp4`.

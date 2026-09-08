@@ -37,7 +37,7 @@ Usage (uv resolves and installs deps automatically, no venv needed):
 
     # a looping clip: ends on the frame it started from
     ./generate_video.py "a candle flame flickers" --image frame.png --loop \
-        --duration 4 --resolution 720p --seed 42 --no-audio
+        --duration 8 --resolution 720p
 
 See README.md for the full flag list and the constraints the API enforces.
 """
@@ -173,6 +173,14 @@ def validate_inputs(*, image: Path | None, last_frame: Path | None,
         raise ValueError(
             f"Reference images require --duration 8, got {duration}."
         )
+    if duration != 8 and last_frame is not None:
+        # Not in Google's docs, which list only extension, reference images
+        # and 1080p/4k as requiring 8s. Established by probing the live API:
+        # interpolation at 4s returns "Your use case is currently not
+        # supported."
+        raise ValueError(
+            f"--last-frame requires --duration 8, got {duration}."
+        )
 
 
 class LoopOptions(NamedTuple):
@@ -180,38 +188,38 @@ class LoopOptions(NamedTuple):
 
     last_frame: Path | None
     negative_prompt: str | None
-    enhance_prompt: bool | None
 
 
 def resolve_loop_options(*, loop: bool, image: Path | None,
                           last_frame: Path | None,
                           negative_prompt: str | None) -> LoopOptions:
-    """Apply the --loop preset: end on the starting frame, suppress drift.
-
-    Prompt enhancement is disabled because it rewrites the prompt and so
-    voids the reproducibility a fixed --seed would otherwise give you.
-    """
+    """Apply the --loop preset: end on the starting frame, suppress drift."""
     if not loop:
-        return LoopOptions(last_frame, negative_prompt, None)
+        return LoopOptions(last_frame, negative_prompt)
 
     if image is None:
         raise ValueError("--loop requires --image to loop back to.")
     if last_frame is not None:
         raise ValueError("--loop sets the last frame itself; drop --last-frame.")
 
-    return LoopOptions(image, negative_prompt or LOOP_NEGATIVE_PROMPT, False)
+    return LoopOptions(image, negative_prompt or LOOP_NEGATIVE_PROMPT)
 
 
 def build_config(*, aspect_ratio: str, resolution: str, duration: int,
-                  negative_prompt: str | None = None, seed: int | None = None,
+                  negative_prompt: str | None = None,
                   person_generation: str | None = None,
                   last_frame: types.Image | None = None,
                   reference_images: list[tuple[types.Image, str]] | None = None,
-                  enhance_prompt: bool | None = None,
-                  generate_audio: bool | None = None,
                   ) -> types.GenerateVideosConfig:
     """Map resolved CLI values onto the SDK config. Unset fields stay None so
-    the API applies its own defaults."""
+    the API applies its own defaults.
+
+    `seed`, `generate_audio`, `fps`, `output_gcs_uri`, `pubsub_topic`, `mask`,
+    `compression_quality`, `labels` and `resize_mode` are deliberately absent:
+    the SDK rejects them outside Vertex AI, and this script talks to the Gemini
+    Developer API. `enhance_prompt` is absent because veo-3.1-generate-preview
+    rejects it outright ("`enhancePrompt` isn't supported by this model").
+    """
     wrapped_references = [
         types.VideoGenerationReferenceImage(image=image, reference_type=reference_type)
         for image, reference_type in (reference_images or [])
@@ -222,12 +230,9 @@ def build_config(*, aspect_ratio: str, resolution: str, duration: int,
         resolution=resolution,
         duration_seconds=duration,
         negative_prompt=negative_prompt,
-        seed=seed,
         person_generation=person_generation,
         last_frame=last_frame,
         reference_images=wrapped_references,
-        enhance_prompt=enhance_prompt,
-        generate_audio=generate_audio,
     )
 
 
@@ -359,14 +364,9 @@ def main():
     parser.add_argument("--duration", type=int, default=8, choices=[4, 6, 8],
                          help="Clip length in seconds. Must be 8 above 720p "
                               "or with reference images")
-    parser.add_argument("--seed", type=int,
-                         help="Fixed seed for reproducible generations")
     parser.add_argument("--person-generation",
                          choices=["dont_allow", "allow_adult", "allow_all"],
                          help="Whether people may be generated")
-    parser.add_argument("--no-audio", action="store_true",
-                         help="Disable the generated soundtrack (audio does "
-                              "not loop cleanly)")
     parser.add_argument("--output", default="output.mp4",
                          help="File path to save the generated video to")
     parser.add_argument("--poll-seconds", type=int, default=10,
@@ -413,12 +413,9 @@ def main():
         resolution=args.resolution,
         duration=args.duration,
         negative_prompt=loop_options.negative_prompt,
-        seed=args.seed,
         person_generation=args.person_generation,
         last_frame=last_frame,
         reference_images=loaded_references,
-        enhance_prompt=loop_options.enhance_prompt,
-        generate_audio=False if args.no_audio else None,
     )
 
     if args.dry_run:
