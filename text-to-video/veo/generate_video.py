@@ -49,6 +49,7 @@ See README.md for the full flag list and the constraints the API enforces.
 
 import argparse
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -425,6 +426,74 @@ def estimate_cost_usd(*, model: str, resolution: str,
     if rate is None:
         return None
     return rate * duration
+
+
+def format_wait(seconds: float) -> str:
+    """Render a wait for a human, rounding up so it is never optimistic.
+
+    Distinct from format_seconds, which formats filtergraph timestamps.
+    """
+    total = max(1, math.ceil(seconds))
+    minutes, remainder = divmod(total, 60)
+    return f"{minutes}m{remainder}s" if minutes else f"{remainder}s"
+
+
+# The Gemini API enforces a spend-based rate limit over a rolling window and
+# returns a bare 429 when it is crossed, with no RetryInfo and no endpoint to
+# query remaining headroom. The cap is tier-dependent and the API will not say
+# which tier a key is on, so assume Tier 1 and let .env.local raise it.
+SPEND_WINDOW_SECONDS = 600
+DEFAULT_SPEND_LIMIT_USD = 10.00
+SPEND_LIMIT_ENV_VAR = "VEO_SPEND_LIMIT_USD"
+LEDGER_FILE = Path(__file__).resolve().parent / ".spend_ledger.json"
+
+
+def resolve_spend_limit_usd(raw: str | None) -> float:
+    """The spend cap for the rolling window, from the environment or default."""
+    if raw is None or not raw.strip():
+        return DEFAULT_SPEND_LIMIT_USD
+    try:
+        limit = float(raw)
+    except ValueError:
+        limit = 0.0
+    if limit <= 0:
+        raise ValueError(
+            f"{SPEND_LIMIT_ENV_VAR} must be a positive dollar amount, "
+            f"got {raw!r}."
+        )
+    return limit
+
+
+def read_ledger(path: Path) -> list[dict]:
+    """Every spend entry on disk, or none if the ledger is unusable.
+
+    A missing or corrupt ledger degrades to "nothing spent" rather than
+    raising: an accounting file must never be the reason a generation fails.
+    """
+    try:
+        entries = json.loads(path.read_text())
+    except (OSError, ValueError, TypeError):
+        return []
+    if not isinstance(entries, list):
+        return []
+
+    usable = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            entry = dict(entry, timestamp=float(entry["timestamp"]),
+                         usd=float(entry["usd"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        usable.append(entry)
+    return usable
+
+
+def prune_entries(entries: list[dict], *, now: float) -> list[dict]:
+    """The entries still inside the rolling spend window."""
+    cutoff = now - SPEND_WINDOW_SECONDS
+    return [entry for entry in entries if entry["timestamp"] > cutoff]
 
 
 def is_transient_error(exc: BaseException) -> bool:

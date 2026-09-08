@@ -14,6 +14,7 @@ Run with:
     uv run test_generate_video.py
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -555,3 +556,112 @@ def test_estimate_cost_usd_returns_none_for_a_resolution_the_model_does_not_supp
     assert generate_video.estimate_cost_usd(
         model="veo-3.1-lite-generate-preview", resolution="4k", duration=8,
     ) is None
+
+
+# --- format_wait -----------------------------------------------------------
+
+def test_format_wait_renders_minutes_and_seconds():
+    assert generate_video.format_wait(372) == "6m12s"
+
+
+def test_format_wait_omits_minutes_under_a_minute():
+    assert generate_video.format_wait(45) == "45s"
+
+
+def test_format_wait_rounds_a_partial_second_up():
+    assert generate_video.format_wait(44.2) == "45s"
+
+
+def test_format_wait_never_reports_zero_for_a_real_wait():
+    assert generate_video.format_wait(0.1) == "1s"
+
+
+# --- resolve_spend_limit_usd -----------------------------------------------
+
+def test_resolve_spend_limit_usd_defaults_to_ten_dollars():
+    assert generate_video.resolve_spend_limit_usd(None) == pytest.approx(10.00)
+
+
+def test_resolve_spend_limit_usd_reads_the_environment_override():
+    assert generate_video.resolve_spend_limit_usd("2.50") == pytest.approx(2.50)
+
+
+def test_resolve_spend_limit_usd_ignores_a_blank_value():
+    assert generate_video.resolve_spend_limit_usd("  ") == pytest.approx(10.00)
+
+
+def test_resolve_spend_limit_usd_rejects_a_non_numeric_value():
+    with pytest.raises(ValueError, match="VEO_SPEND_LIMIT_USD"):
+        generate_video.resolve_spend_limit_usd("ten dollars")
+
+
+def test_resolve_spend_limit_usd_rejects_a_non_positive_value():
+    with pytest.raises(ValueError, match="VEO_SPEND_LIMIT_USD"):
+        generate_video.resolve_spend_limit_usd("0")
+
+
+# --- read_ledger -----------------------------------------------------------
+
+def test_read_ledger_returns_no_entries_when_the_file_is_missing(tmp_path):
+    assert generate_video.read_ledger(tmp_path / "absent.json") == []
+
+
+def test_read_ledger_reads_recorded_entries(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps([
+        {"timestamp": 1000.0, "usd": 3.20, "model": "veo-3.1-generate-preview"},
+    ]))
+
+    entries = generate_video.read_ledger(ledger)
+
+    assert len(entries) == 1
+    assert entries[0]["timestamp"] == pytest.approx(1000.0)
+    assert entries[0]["usd"] == pytest.approx(3.20)
+
+
+def test_read_ledger_ignores_a_corrupt_file(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text("{not json")
+
+    assert generate_video.read_ledger(ledger) == []
+
+
+def test_read_ledger_ignores_a_file_that_is_not_a_list(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text('{"usd": 1}')
+
+    assert generate_video.read_ledger(ledger) == []
+
+
+def test_read_ledger_drops_entries_missing_a_timestamp_or_amount(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps([
+        {"timestamp": 1000.0, "usd": 3.20},
+        {"timestamp": 1001.0},
+        {"usd": 1.0},
+        "not a dict",
+    ]))
+
+    entries = generate_video.read_ledger(ledger)
+
+    assert [e["timestamp"] for e in entries] == [pytest.approx(1000.0)]
+
+
+# --- prune_entries ---------------------------------------------------------
+
+def test_prune_entries_keeps_entries_inside_the_window():
+    entries = [{"timestamp": 500.0, "usd": 1.0}]
+
+    assert generate_video.prune_entries(entries, now=1000.0) == entries
+
+
+def test_prune_entries_drops_entries_older_than_the_window():
+    entries = [{"timestamp": 399.0, "usd": 1.0}]
+
+    assert generate_video.prune_entries(entries, now=1000.0) == []
+
+
+def test_prune_entries_drops_an_entry_exactly_at_the_window_edge():
+    entries = [{"timestamp": 400.0, "usd": 1.0}]
+
+    assert generate_video.prune_entries(entries, now=1000.0) == []
