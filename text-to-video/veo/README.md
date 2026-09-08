@@ -27,7 +27,40 @@ directory, so it runs correctly from anywhere; a missing file is a hard error
 before any request is made.
 
 Every generation is billed, so use `--dry-run` while you are still working out
-the flags.
+the flags. `--dry-run` also prints what the request would cost.
+
+### The spend guard
+
+The Gemini API enforces a **spend-based rate limit over a rolling 10-minute
+window** — $10 on Tier 1 — and returns a bare `429 RESOURCE_EXHAUSTED` when you
+cross it, with no `RetryInfo` and no endpoint to ask how much headroom is left.
+At $0.40/second for Veo 3.1 Standard, three 8-second clips ($9.60) is enough to
+trip it, which is easy to do: a seamless loop takes two generations.
+
+So the script keeps its own books. A request's cost is deterministic before it
+is sent — model x resolution x duration — so each charge is appended to
+`.spend_ledger.json` (gitignored, beside the script) and the next request is
+refused if it would cross the cap:
+
+```
+Error: this request costs $3.20; $9.60 already spent in the last 10 minutes
+against a $10.00 limit. Wait 6m12s, or pass --force-spend to send it anyway.
+```
+
+Worth knowing:
+
+- **The cap defaults to $10.00.** The API will not say which tier a key is on,
+  so the script assumes Tier 1. Set `VEO_SPEND_LIMIT_USD` in `.env.local` to
+  raise it ($50 on Tier 2, $200 on Tier 3).
+- **A model with no published price is never blocked.** `--model` takes an
+  arbitrary string; an unrecognised one prints a note and the request goes out.
+- **The ledger is advisory, not authoritative.** It records what this script
+  spent — generations from AI Studio or another machine are invisible to it,
+  and entries are written when a request is accepted, so a generation that
+  Veo's safety filters block afterwards is counted but not charged. Both errors
+  age out within 10 minutes.
+- **A corrupt or unwritable ledger never blocks a run.** Delete it to reset:
+  `rm .spend_ledger.json`.
 
 ## Usage
 
@@ -72,6 +105,7 @@ piped somewhere useful.
 | `--person-generation` | `dont_allow`, `allow_adult`, `allow_all` |
 | `--aspect-ratio`, `--resolution` | `16:9`/`9:16`, `720p`/`1080p`/`4k` |
 | `--dry-run` | Print the resolved request and exit; no API call |
+| `--force-spend` | Send the request even if it would cross the spend limit |
 | `--model` | Veo model ID (default `veo-3.1-generate-preview`) |
 | `--output` | Where to write the `.mp4` (default `output.mp4`) |
 | `--poll-seconds` | Seconds between status checks (default 10) |

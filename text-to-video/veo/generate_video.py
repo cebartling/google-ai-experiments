@@ -50,6 +50,7 @@ See README.md for the full flag list and the constraints the API enforces.
 import argparse
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -703,6 +704,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                          help="Print the resolved request and exit without "
                               "calling the API")
+    parser.add_argument("--force-spend", action="store_true",
+                         help="Send the request even if it would cross the "
+                              "rolling spend limit")
     args = parser.parse_args()
 
     try:
@@ -750,12 +754,20 @@ def main():
         reference_images=loaded_references,
     )
 
+    cost_usd = estimate_cost_usd(model=args.model, resolution=args.resolution,
+                                 duration=args.duration)
+
     if args.dry_run:
         print(f"model: {args.model}")
         print(f"prompt: {prompt}")
         print(f"image: {args.image or '(none)'}")
         if args.crossfade:
             print(f"crossfade: {args.crossfade}s applied after download")
+        if cost_usd is None:
+            print(f"estimated cost: unknown (no published price for "
+                  f"{args.model})")
+        else:
+            print(f"estimated cost: ${cost_usd:.2f}")
         # exclude_none keeps the output to what is actually being sent.
         payload = redact_image_bytes(config.model_dump(mode="json", exclude_none=True))
         print(json.dumps(payload, indent=2))
@@ -767,11 +779,34 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    now = time.time()
+    if cost_usd is None:
+        print(f"Skipping the spend check: no published price for "
+              f"{args.model}.", file=sys.stderr)
+    elif not args.force_spend:
+        try:
+            limit_usd = resolve_spend_limit_usd(os.environ.get(SPEND_LIMIT_ENV_VAR))
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        message = spend_preflight_error(
+            cost_usd=cost_usd,
+            entries=prune_entries(read_ledger(LEDGER_FILE), now=now),
+            limit_usd=limit_usd,
+            now=now,
+        )
+        if message:
+            print(f"Error: {message}", file=sys.stderr)
+            sys.exit(1)
+
     client = build_client()
 
     print(f"Starting generation with {args.model}...", file=sys.stderr)
     try:
         operation = start_generation(client, prompt, args.model, config, image)
+        if cost_usd is not None:
+            record_spend(LEDGER_FILE, usd=cost_usd, model=args.model,
+                         now=time.time())
     except Exception as e:
         print(f"Failed to start generation: {e}", file=sys.stderr)
         sys.exit(1)
