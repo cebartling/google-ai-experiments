@@ -69,7 +69,7 @@ piped somewhere useful.
 | `--loop` | End on the starting frame; requires `--image` |
 | `--crossfade [SECONDS]` | Dissolve the tail over the head to hide the seam (default 0.5); requires `--loop` |
 | `--duration {4,6,8}` | Clip length in seconds (default 8) |
-| `--person-generation` | `dont_allow`, `allow_adult`, `allow_all` |
+| `--person-generation` | `allow_all` (text-to-video) or `allow_adult` (image-driven) — see below |
 | `--aspect-ratio`, `--resolution` | `16:9`/`9:16`, `720p`/`1080p`/`4k` |
 | `--dry-run` | Print the resolved request and exit; no API call |
 | `--model` | Veo model ID (default `veo-3.1-generate-preview`) |
@@ -194,6 +194,29 @@ These are checked locally, before any request is sent:
 | `--reference-image` | Max 3; cannot combine with `--image` |
 | `--duration` | Must be `8` at `1080p` or `4k`, with reference images, and with `--last-frame` |
 
+### `--person-generation` depends on the generation mode
+
+Veo 3.1 accepts exactly **one** value per mode, and it is not the same one:
+
+| Mode | Accepted value |
+| --- | --- |
+| Text-to-video, extension | `allow_all` only |
+| Image-to-video, interpolation, reference images | `allow_adult` only |
+
+Passing the other one returns `400 INVALID_ARGUMENT: allow_adult for
+personGeneration is currently not supported` — a message that reads like the
+value is unsupported outright, when it is only unsupported *for that mode*.
+
+`dont_allow` is in the SDK's `PersonGeneration` enum but appears in neither
+list, so it is not offered here.
+
+The script **warns** rather than rejecting, because the docs also state that in
+EU, UK, CH and MENA locations `allow_adult` is the only accepted value for any
+mode — so a text-to-video request that looks wrong from the US is the only
+correct one there. A rejected request costs nothing, so the API gets the final
+say. In practice the API default is right for both modes; the flag is only
+worth setting if you have a reason to be explicit.
+
 Also worth knowing: output is 24 fps, one video per request, and generated
 videos are deleted from the server after **2 days** — download promptly. All
 output is SynthID-watermarked.
@@ -210,6 +233,10 @@ script. Copy `.env.example` onto it.
 
 **A flag combination is rejected before anything happens.** That is the local
 validation doing its job; the message names the rule. Nothing was billed.
+
+**"allow_adult for personGeneration is currently not supported".** The value
+is fine — the *mode* is wrong. Text-to-video takes `allow_all`; only
+image-driven requests take `allow_adult`. See above. Nothing was billed.
 
 **Generations are not reproducible.** There is no seed. `seed` exists in the
 API but the SDK rejects it outside Vertex AI, so repeated runs of an identical
