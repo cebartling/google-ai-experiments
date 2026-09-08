@@ -378,3 +378,121 @@ def test_redact_image_bytes_leaves_the_original_untouched():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --- validate_crossfade ----------------------------------------------------
+
+
+def test_validate_crossfade_accepts_none():
+    generate_video.validate_crossfade(crossfade=None, loop=False, duration=8)
+
+
+def test_validate_crossfade_accepts_a_fade_shorter_than_the_clip():
+    generate_video.validate_crossfade(crossfade=0.5, loop=True, duration=8)
+
+
+def test_validate_crossfade_requires_loop():
+    with pytest.raises(ValueError, match="--loop"):
+        generate_video.validate_crossfade(crossfade=0.5, loop=False, duration=8)
+
+
+def test_validate_crossfade_rejects_a_non_positive_fade():
+    with pytest.raises(ValueError, match="greater than zero"):
+        generate_video.validate_crossfade(crossfade=0, loop=True, duration=8)
+
+
+def test_validate_crossfade_rejects_a_fade_as_long_as_the_clip():
+    with pytest.raises(ValueError, match="shorter than the clip"):
+        generate_video.validate_crossfade(crossfade=8, loop=True, duration=8)
+
+
+# --- build_crossfade_filter ------------------------------------------------
+
+
+def test_build_crossfade_filter_dissolves_the_tail_over_the_head():
+    graph = generate_video.build_crossfade_filter(
+        clip_seconds=8, fade_seconds=0.5, has_audio=False,
+    )
+
+    # The tail starts where the kept portion ends: 8 - 0.5.
+    assert "trim=7.5:8" in graph
+    assert "trim=0:7.5" in graph
+    # Tail (B) dominates at T=0 and the head (A) at the end of the fade.
+    assert "A*(T/0.5)+B*(1-(T/0.5))" in graph
+    assert "[vout]" in graph
+
+
+def test_build_crossfade_filter_omits_audio_when_the_clip_has_none():
+    graph = generate_video.build_crossfade_filter(
+        clip_seconds=8, fade_seconds=0.5, has_audio=False,
+    )
+
+    assert "afade" not in graph
+    assert "[aout]" not in graph
+
+
+def test_build_crossfade_filter_mirrors_the_fade_on_audio():
+    graph = generate_video.build_crossfade_filter(
+        clip_seconds=8, fade_seconds=0.5, has_audio=True,
+    )
+
+    assert "afade=t=in:st=0:d=0.5" in graph
+    assert "afade=t=out:st=0:d=0.5" in graph
+    # normalize=0 keeps the sum from halving the level through the blend.
+    assert "amix=inputs=2:normalize=0" in graph
+    assert "[aout]" in graph
+
+
+# --- apply_crossfade -------------------------------------------------------
+
+
+def test_apply_crossfade_reports_a_missing_ffmpeg(tmp_path, monkeypatch):
+    monkeypatch.setattr(generate_video.shutil, "which", lambda name: None)
+
+    with pytest.raises(generate_video.CrossfadeError, match="ffmpeg"):
+        generate_video.apply_crossfade(
+            str(tmp_path / "clip.mp4"), clip_seconds=8, fade_seconds=0.5,
+        )
+
+
+def test_apply_crossfade_replaces_the_clip_in_place(tmp_path, monkeypatch):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"original")
+    monkeypatch.setattr(generate_video.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(generate_video, "has_audio_stream", lambda path: True)
+
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        # Stand in for ffmpeg writing its output file.
+        Path(command[-1]).write_bytes(b"crossfaded")
+        return generate_video.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(generate_video.subprocess, "run", fake_run)
+
+    generate_video.apply_crossfade(str(clip), clip_seconds=8, fade_seconds=0.5)
+
+    assert clip.read_bytes() == b"crossfaded"
+    assert commands[0][0] == "/usr/bin/ffmpeg"
+    # The temporary file ffmpeg wrote to is not left behind.
+    assert [p.name for p in tmp_path.iterdir()] == ["clip.mp4"]
+
+
+def test_apply_crossfade_raises_when_ffmpeg_fails(tmp_path, monkeypatch):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"original")
+    monkeypatch.setattr(generate_video.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(generate_video, "has_audio_stream", lambda path: False)
+    monkeypatch.setattr(
+        generate_video.subprocess, "run",
+        lambda command, **kwargs: generate_video.subprocess.CompletedProcess(
+            command, 1, "", "Invalid argument"
+        ),
+    )
+
+    with pytest.raises(generate_video.CrossfadeError, match="Invalid argument"):
+        generate_video.apply_crossfade(str(clip), clip_seconds=8, fade_seconds=0.5)
+
+    # The original clip survives a failed fade.
+    assert clip.read_bytes() == b"original"
