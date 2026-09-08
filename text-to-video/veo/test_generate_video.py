@@ -14,6 +14,7 @@ Run with:
     uv run test_generate_video.py
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -496,3 +497,334 @@ def test_apply_crossfade_raises_when_ffmpeg_fails(tmp_path, monkeypatch):
 
     # The original clip survives a failed fade.
     assert clip.read_bytes() == b"original"
+
+
+# --- estimate_cost_usd -----------------------------------------------------
+
+def test_estimate_cost_usd_prices_standard_veo_at_forty_cents_a_second():
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-generate-preview", resolution="1080p", duration=8,
+    )
+
+    assert cost == pytest.approx(3.20)
+
+
+def test_estimate_cost_usd_charges_more_for_standard_at_4k():
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-generate-preview", resolution="4k", duration=8,
+    )
+
+    assert cost == pytest.approx(4.80)
+
+
+@pytest.mark.parametrize("resolution,expected", [
+    ("720p", 0.80),
+    ("1080p", 0.96),
+    ("4k", 2.40),
+])
+def test_estimate_cost_usd_prices_fast_by_resolution(resolution, expected):
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-fast-generate-preview", resolution=resolution, duration=8,
+    )
+
+    assert cost == pytest.approx(expected)
+
+
+def test_estimate_cost_usd_prices_lite_below_fast():
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-lite-generate-preview", resolution="720p", duration=8,
+    )
+
+    assert cost == pytest.approx(0.40)
+
+
+def test_estimate_cost_usd_scales_with_duration():
+    cost = generate_video.estimate_cost_usd(
+        model="veo-3.1-lite-generate-preview", resolution="720p", duration=4,
+    )
+
+    assert cost == pytest.approx(0.20)
+
+
+def test_estimate_cost_usd_returns_none_for_an_unknown_model():
+    assert generate_video.estimate_cost_usd(
+        model="veo-9-imaginary", resolution="1080p", duration=8,
+    ) is None
+
+
+def test_estimate_cost_usd_returns_none_for_a_resolution_the_model_does_not_support():
+    assert generate_video.estimate_cost_usd(
+        model="veo-3.1-lite-generate-preview", resolution="4k", duration=8,
+    ) is None
+
+
+# --- format_wait -----------------------------------------------------------
+
+def test_format_wait_renders_minutes_and_seconds():
+    assert generate_video.format_wait(372) == "6m12s"
+
+
+def test_format_wait_omits_minutes_under_a_minute():
+    assert generate_video.format_wait(45) == "45s"
+
+
+def test_format_wait_rounds_a_partial_second_up():
+    assert generate_video.format_wait(44.2) == "45s"
+
+
+def test_format_wait_never_reports_zero_for_a_real_wait():
+    assert generate_video.format_wait(0.1) == "1s"
+
+
+# --- resolve_spend_limit_usd -----------------------------------------------
+
+def test_resolve_spend_limit_usd_defaults_to_ten_dollars():
+    assert generate_video.resolve_spend_limit_usd(None) == pytest.approx(10.00)
+
+
+def test_resolve_spend_limit_usd_reads_the_environment_override():
+    assert generate_video.resolve_spend_limit_usd("2.50") == pytest.approx(2.50)
+
+
+def test_resolve_spend_limit_usd_ignores_a_blank_value():
+    assert generate_video.resolve_spend_limit_usd("  ") == pytest.approx(10.00)
+
+
+def test_resolve_spend_limit_usd_rejects_a_non_numeric_value():
+    with pytest.raises(ValueError, match="VEO_SPEND_LIMIT_USD"):
+        generate_video.resolve_spend_limit_usd("ten dollars")
+
+
+def test_resolve_spend_limit_usd_rejects_a_non_positive_value():
+    with pytest.raises(ValueError, match="VEO_SPEND_LIMIT_USD"):
+        generate_video.resolve_spend_limit_usd("0")
+
+
+# --- read_ledger -----------------------------------------------------------
+
+def test_read_ledger_returns_no_entries_when_the_file_is_missing(tmp_path):
+    assert generate_video.read_ledger(tmp_path / "absent.json") == []
+
+
+def test_read_ledger_reads_recorded_entries(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps([
+        {"timestamp": 1000.0, "usd": 3.20, "model": "veo-3.1-generate-preview"},
+    ]))
+
+    entries = generate_video.read_ledger(ledger)
+
+    assert len(entries) == 1
+    assert entries[0]["timestamp"] == pytest.approx(1000.0)
+    assert entries[0]["usd"] == pytest.approx(3.20)
+
+
+def test_read_ledger_ignores_a_corrupt_file(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text("{not json")
+
+    assert generate_video.read_ledger(ledger) == []
+
+
+def test_read_ledger_ignores_a_file_that_is_not_a_list(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text('{"usd": 1}')
+
+    assert generate_video.read_ledger(ledger) == []
+
+
+def test_read_ledger_drops_entries_missing_a_timestamp_or_amount(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps([
+        {"timestamp": 1000.0, "usd": 3.20},
+        {"timestamp": 1001.0},
+        {"usd": 1.0},
+        "not a dict",
+    ]))
+
+    entries = generate_video.read_ledger(ledger)
+
+    assert [e["timestamp"] for e in entries] == [pytest.approx(1000.0)]
+
+
+# --- prune_entries ---------------------------------------------------------
+
+def test_prune_entries_keeps_entries_inside_the_window():
+    entries = [{"timestamp": 500.0, "usd": 1.0}]
+
+    assert generate_video.prune_entries(entries, now=1000.0) == entries
+
+
+def test_prune_entries_drops_entries_older_than_the_window():
+    entries = [{"timestamp": 399.0, "usd": 1.0}]
+
+    assert generate_video.prune_entries(entries, now=1000.0) == []
+
+
+def test_prune_entries_drops_an_entry_exactly_at_the_window_edge():
+    entries = [{"timestamp": 400.0, "usd": 1.0}]
+
+    assert generate_video.prune_entries(entries, now=1000.0) == []
+
+
+# --- record_spend ----------------------------------------------------------
+
+def test_record_spend_creates_the_ledger_with_one_entry(tmp_path):
+    ledger = tmp_path / ".spend_ledger.json"
+
+    generate_video.record_spend(ledger, usd=3.20, model="veo-3.1", now=1000.0)
+
+    entries = generate_video.read_ledger(ledger)
+    assert len(entries) == 1
+    assert entries[0]["timestamp"] == pytest.approx(1000.0)
+    assert entries[0]["usd"] == pytest.approx(3.20)
+    assert entries[0]["model"] == "veo-3.1"
+
+
+def test_record_spend_appends_to_existing_entries(tmp_path):
+    ledger = tmp_path / ".spend_ledger.json"
+    generate_video.record_spend(ledger, usd=3.20, model="veo-3.1", now=1000.0)
+
+    generate_video.record_spend(ledger, usd=0.40, model="veo-3.1", now=1100.0)
+
+    amounts = [e["usd"] for e in generate_video.read_ledger(ledger)]
+    assert amounts == [pytest.approx(3.20), pytest.approx(0.40)]
+
+
+def test_record_spend_prunes_entries_that_have_aged_out(tmp_path):
+    ledger = tmp_path / ".spend_ledger.json"
+    generate_video.record_spend(ledger, usd=3.20, model="veo-3.1", now=1000.0)
+
+    generate_video.record_spend(ledger, usd=0.40, model="veo-3.1", now=1700.0)
+
+    amounts = [e["usd"] for e in generate_video.read_ledger(ledger)]
+    assert amounts == [pytest.approx(0.40)]
+
+
+def test_record_spend_leaves_no_temporary_file_behind(tmp_path):
+    ledger = tmp_path / ".spend_ledger.json"
+
+    generate_video.record_spend(ledger, usd=3.20, model="veo-3.1", now=1000.0)
+
+    assert [p.name for p in tmp_path.iterdir()] == [".spend_ledger.json"]
+
+
+def test_record_spend_replaces_a_corrupt_ledger_rather_than_raising(tmp_path):
+    ledger = tmp_path / ".spend_ledger.json"
+    ledger.write_text("{not json")
+
+    generate_video.record_spend(ledger, usd=3.20, model="veo-3.1", now=1000.0)
+
+    assert len(generate_video.read_ledger(ledger)) == 1
+
+
+def test_record_spend_is_silent_when_the_ledger_cannot_be_written(tmp_path):
+    unwritable = tmp_path / "no-such-dir" / ".spend_ledger.json"
+
+    generate_video.record_spend(unwritable, usd=3.20, model="veo-3.1", now=1000.0)
+
+    assert not unwritable.exists()
+
+
+# --- wait_seconds_until_affordable -----------------------------------------
+
+def test_wait_seconds_until_affordable_is_zero_when_the_request_fits():
+    wait = generate_video.wait_seconds_until_affordable(
+        cost_usd=3.20,
+        entries=[{"timestamp": 900.0, "usd": 3.20}],
+        limit_usd=10.00, now=1000.0,
+    )
+
+    assert wait == 0
+
+
+def test_wait_seconds_until_affordable_is_zero_when_the_request_lands_exactly_on_the_limit():
+    wait = generate_video.wait_seconds_until_affordable(
+        cost_usd=0.40,
+        entries=[{"timestamp": 900.0, "usd": 9.60}],
+        limit_usd=10.00, now=1000.0,
+    )
+
+    assert wait == 0
+
+
+def test_wait_seconds_until_affordable_waits_for_the_oldest_entry_to_age_out():
+    wait = generate_video.wait_seconds_until_affordable(
+        cost_usd=3.20,
+        entries=[{"timestamp": 772.0, "usd": 9.60}],
+        limit_usd=10.00, now=1000.0,
+    )
+
+    assert wait == pytest.approx(372.0)
+
+
+def test_wait_seconds_until_affordable_waits_for_several_entries_when_one_is_not_enough():
+    wait = generate_video.wait_seconds_until_affordable(
+        cost_usd=3.20,
+        entries=[
+            {"timestamp": 500.0, "usd": 1.00},
+            {"timestamp": 772.0, "usd": 8.60},
+        ],
+        limit_usd=10.00, now=1000.0,
+    )
+
+    # Shedding the $1.00 entry is not enough to make room, so the wait runs
+    # until the second entry expires too.
+    assert wait == pytest.approx(372.0)
+
+
+def test_wait_seconds_until_affordable_returns_none_when_the_request_alone_exceeds_the_limit():
+    wait = generate_video.wait_seconds_until_affordable(
+        cost_usd=12.00, entries=[], limit_usd=10.00, now=1000.0,
+    )
+
+    assert wait is None
+
+
+# --- spend_preflight_error -------------------------------------------------
+
+def test_spend_preflight_error_is_none_when_the_request_fits():
+    assert generate_video.spend_preflight_error(
+        cost_usd=3.20,
+        entries=[{"timestamp": 900.0, "usd": 3.20}],
+        limit_usd=10.00, now=1000.0,
+    ) is None
+
+
+def test_spend_preflight_error_is_none_at_exactly_the_limit():
+    assert generate_video.spend_preflight_error(
+        cost_usd=0.40,
+        entries=[{"timestamp": 900.0, "usd": 9.60}],
+        limit_usd=10.00, now=1000.0,
+    ) is None
+
+
+def test_spend_preflight_error_is_none_when_the_cost_is_unknown():
+    assert generate_video.spend_preflight_error(
+        cost_usd=None,
+        entries=[{"timestamp": 900.0, "usd": 9.60}],
+        limit_usd=10.00, now=1000.0,
+    ) is None
+
+
+def test_spend_preflight_error_describes_the_cost_the_spend_and_the_wait():
+    message = generate_video.spend_preflight_error(
+        cost_usd=3.20,
+        entries=[{"timestamp": 772.0, "usd": 9.60}],
+        limit_usd=10.00, now=1000.0,
+    )
+
+    assert message == (
+        "this request costs $3.20; $9.60 already spent in the last 10 "
+        "minutes against a $10.00 limit. Wait 6m12s, or pass --force-spend "
+        "to send it anyway."
+    )
+
+
+def test_spend_preflight_error_says_waiting_cannot_help_when_the_cost_exceeds_the_limit():
+    message = generate_video.spend_preflight_error(
+        cost_usd=12.00, entries=[], limit_usd=10.00, now=1000.0,
+    )
+
+    assert "waiting will not help" in message
+    assert "--force-spend" in message

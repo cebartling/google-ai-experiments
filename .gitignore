@@ -19,6 +19,7 @@ bin-release/
 
 # Local environment files
 text-to-video/veo/.env.local
+text-to-video/veo/.spend_ledger.json
 
 # Python
 __pycache__/

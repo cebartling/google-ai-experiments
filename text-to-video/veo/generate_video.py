@@ -49,6 +49,8 @@ See README.md for the full flag list and the constraints the API enforces.
 
 import argparse
 import json
+import math
+import os
 import shutil
 import subprocess
 import sys
@@ -399,6 +401,180 @@ def redact_image_bytes(payload):
     return payload
 
 
+# Published Veo prices, in US dollars per second of generated video, from
+# https://ai.google.dev/gemini-api/docs/pricing (paid tier, video with audio,
+# which is the only mode this script can request). A model or resolution that
+# is absent here simply cannot be priced locally.
+VEO_PRICE_PER_SECOND_USD = {
+    "veo-3.1-generate-preview": {"720p": 0.40, "1080p": 0.40, "4k": 0.60},
+    "veo-3.1-fast-generate-preview": {"720p": 0.10, "1080p": 0.12, "4k": 0.30},
+    "veo-3.1-lite-generate-preview": {"720p": 0.05, "1080p": 0.08},
+}
+
+
+def estimate_cost_usd(*, model: str, resolution: str,
+                      duration: int) -> float | None:
+    """What this request will cost, or None if it cannot be priced.
+
+    --model takes an arbitrary string and prices change, so an unrecognised
+    model or resolution returns None rather than guessing. Callers must treat
+    None as "unknown" and let the request through.
+    """
+    rates = VEO_PRICE_PER_SECOND_USD.get(model)
+    if rates is None:
+        return None
+    rate = rates.get(resolution)
+    if rate is None:
+        return None
+    return rate * duration
+
+
+def format_wait(seconds: float) -> str:
+    """Render a wait for a human, rounding up so it is never optimistic.
+
+    Distinct from format_seconds, which formats filtergraph timestamps.
+    """
+    total = max(1, math.ceil(seconds))
+    minutes, remainder = divmod(total, 60)
+    return f"{minutes}m{remainder}s" if minutes else f"{remainder}s"
+
+
+# The Gemini API enforces a spend-based rate limit over a rolling window and
+# returns a bare 429 when it is crossed, with no RetryInfo and no endpoint to
+# query remaining headroom. The cap is tier-dependent and the API will not say
+# which tier a key is on, so assume Tier 1 and let .env.local raise it.
+SPEND_WINDOW_SECONDS = 600
+DEFAULT_SPEND_LIMIT_USD = 10.00
+SPEND_LIMIT_ENV_VAR = "VEO_SPEND_LIMIT_USD"
+LEDGER_FILE = Path(__file__).resolve().parent / ".spend_ledger.json"
+
+
+def resolve_spend_limit_usd(raw: str | None) -> float:
+    """The spend cap for the rolling window, from the environment or default."""
+    if raw is None or not raw.strip():
+        return DEFAULT_SPEND_LIMIT_USD
+    try:
+        limit = float(raw)
+    except ValueError:
+        limit = 0.0
+    if limit <= 0:
+        raise ValueError(
+            f"{SPEND_LIMIT_ENV_VAR} must be a positive dollar amount, "
+            f"got {raw!r}."
+        )
+    return limit
+
+
+def read_ledger(path: Path) -> list[dict]:
+    """Every spend entry on disk, or none if the ledger is unusable.
+
+    A missing or corrupt ledger degrades to "nothing spent" rather than
+    raising: an accounting file must never be the reason a generation fails.
+    """
+    try:
+        entries = json.loads(path.read_text())
+    except (OSError, ValueError, TypeError):
+        return []
+    if not isinstance(entries, list):
+        return []
+
+    usable = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            entry = dict(entry, timestamp=float(entry["timestamp"]),
+                         usd=float(entry["usd"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        usable.append(entry)
+    return usable
+
+
+def prune_entries(entries: list[dict], *, now: float) -> list[dict]:
+    """The entries still inside the rolling spend window."""
+    cutoff = now - SPEND_WINDOW_SECONDS
+    return [entry for entry in entries if entry["timestamp"] > cutoff]
+
+
+def record_spend(path: Path, *, usd: float, model: str, now: float) -> None:
+    """Append a charge to the ledger, dropping entries that have aged out.
+
+    Written to a temporary file and moved into place, so an interrupted run
+    leaves the previous ledger rather than a truncated one. Write failures are
+    swallowed: the generation is already under way and paid for.
+    """
+    entries = prune_entries(read_ledger(path), now=now)
+    entries.append({"timestamp": now, "usd": usd, "model": model})
+
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temp_path.write_text(json.dumps(entries, indent=2))
+        temp_path.replace(path)
+    except OSError:
+        pass
+
+
+# Dollar comparisons are float arithmetic, so landing exactly on the cap must
+# not read as crossing it.
+SPEND_EPSILON_USD = 1e-9
+
+
+def wait_seconds_until_affordable(*, cost_usd: float, entries: list[dict],
+                                   limit_usd: float, now: float) -> float | None:
+    """How long until this request fits under the cap.
+
+    Zero when it already fits, None when the request alone exceeds the cap and
+    waiting cannot help. Expects entries already pruned to the window.
+    """
+    spent = sum(entry["usd"] for entry in entries)
+    if spent + cost_usd <= limit_usd + SPEND_EPSILON_USD:
+        return 0
+    if cost_usd > limit_usd + SPEND_EPSILON_USD:
+        return None
+
+    # Enough of the oldest charges must age out to make room for this one.
+    needed = spent + cost_usd - limit_usd
+    shed = 0.0
+    for entry in sorted(entries, key=lambda e: e["timestamp"]):
+        shed += entry["usd"]
+        if shed >= needed - SPEND_EPSILON_USD:
+            return entry["timestamp"] + SPEND_WINDOW_SECONDS - now
+    return None
+
+
+def spend_preflight_error(*, cost_usd: float | None, entries: list[dict],
+                           limit_usd: float, now: float) -> str | None:
+    """Why this request should not be sent yet, or None to go ahead.
+
+    An unpriceable request (cost_usd is None) is never blocked; the ledger
+    cannot speak to a model it has no price for.
+    """
+    if cost_usd is None:
+        return None
+
+    wait = wait_seconds_until_affordable(
+        cost_usd=cost_usd, entries=entries, limit_usd=limit_usd, now=now,
+    )
+    if wait == 0:
+        return None
+
+    if wait is None:
+        return (
+            f"this request costs ${cost_usd:.2f}, which alone exceeds the "
+            f"${limit_usd:.2f} limit; waiting will not help. Pass "
+            f"--force-spend to send it anyway."
+        )
+
+    spent = sum(entry["usd"] for entry in entries)
+    window_minutes = SPEND_WINDOW_SECONDS // 60
+    return (
+        f"this request costs ${cost_usd:.2f}; ${spent:.2f} already spent in "
+        f"the last {window_minutes} minutes against a ${limit_usd:.2f} limit. "
+        f"Wait {format_wait(wait)}, or pass --force-spend to send it anyway."
+    )
+
+
 def is_transient_error(exc: BaseException) -> bool:
     """Whether a failed request is worth retrying.
 
@@ -528,6 +704,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                          help="Print the resolved request and exit without "
                               "calling the API")
+    parser.add_argument("--force-spend", action="store_true",
+                         help="Send the request even if it would cross the "
+                              "rolling spend limit")
     args = parser.parse_args()
 
     try:
@@ -575,12 +754,20 @@ def main():
         reference_images=loaded_references,
     )
 
+    cost_usd = estimate_cost_usd(model=args.model, resolution=args.resolution,
+                                 duration=args.duration)
+
     if args.dry_run:
         print(f"model: {args.model}")
         print(f"prompt: {prompt}")
         print(f"image: {args.image or '(none)'}")
         if args.crossfade:
             print(f"crossfade: {args.crossfade}s applied after download")
+        if cost_usd is None:
+            print(f"estimated cost: unknown (no published price for "
+                  f"{args.model})")
+        else:
+            print(f"estimated cost: ${cost_usd:.2f}")
         # exclude_none keeps the output to what is actually being sent.
         payload = redact_image_bytes(config.model_dump(mode="json", exclude_none=True))
         print(json.dumps(payload, indent=2))
@@ -592,11 +779,34 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    now = time.time()
+    if cost_usd is None:
+        print(f"Skipping the spend check: no published price for "
+              f"{args.model}.", file=sys.stderr)
+    elif not args.force_spend:
+        try:
+            limit_usd = resolve_spend_limit_usd(os.environ.get(SPEND_LIMIT_ENV_VAR))
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        message = spend_preflight_error(
+            cost_usd=cost_usd,
+            entries=prune_entries(read_ledger(LEDGER_FILE), now=now),
+            limit_usd=limit_usd,
+            now=now,
+        )
+        if message:
+            print(f"Error: {message}", file=sys.stderr)
+            sys.exit(1)
+
     client = build_client()
 
     print(f"Starting generation with {args.model}...", file=sys.stderr)
     try:
         operation = start_generation(client, prompt, args.model, config, image)
+        if cost_usd is not None:
+            record_spend(LEDGER_FILE, usd=cost_usd, model=args.model,
+                         now=time.time())
     except Exception as e:
         print(f"Failed to start generation: {e}", file=sys.stderr)
         sys.exit(1)
