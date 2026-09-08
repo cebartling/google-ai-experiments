@@ -496,6 +496,84 @@ def prune_entries(entries: list[dict], *, now: float) -> list[dict]:
     return [entry for entry in entries if entry["timestamp"] > cutoff]
 
 
+def record_spend(path: Path, *, usd: float, model: str, now: float) -> None:
+    """Append a charge to the ledger, dropping entries that have aged out.
+
+    Written to a temporary file and moved into place, so an interrupted run
+    leaves the previous ledger rather than a truncated one. Write failures are
+    swallowed: the generation is already under way and paid for.
+    """
+    entries = prune_entries(read_ledger(path), now=now)
+    entries.append({"timestamp": now, "usd": usd, "model": model})
+
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temp_path.write_text(json.dumps(entries, indent=2))
+        temp_path.replace(path)
+    except OSError:
+        pass
+
+
+# Dollar comparisons are float arithmetic, so landing exactly on the cap must
+# not read as crossing it.
+SPEND_EPSILON_USD = 1e-9
+
+
+def wait_seconds_until_affordable(*, cost_usd: float, entries: list[dict],
+                                   limit_usd: float, now: float) -> float | None:
+    """How long until this request fits under the cap.
+
+    Zero when it already fits, None when the request alone exceeds the cap and
+    waiting cannot help. Expects entries already pruned to the window.
+    """
+    spent = sum(entry["usd"] for entry in entries)
+    if spent + cost_usd <= limit_usd + SPEND_EPSILON_USD:
+        return 0
+    if cost_usd > limit_usd + SPEND_EPSILON_USD:
+        return None
+
+    # Enough of the oldest charges must age out to make room for this one.
+    needed = spent + cost_usd - limit_usd
+    shed = 0.0
+    for entry in sorted(entries, key=lambda e: e["timestamp"]):
+        shed += entry["usd"]
+        if shed >= needed - SPEND_EPSILON_USD:
+            return entry["timestamp"] + SPEND_WINDOW_SECONDS - now
+    return None
+
+
+def spend_preflight_error(*, cost_usd: float | None, entries: list[dict],
+                           limit_usd: float, now: float) -> str | None:
+    """Why this request should not be sent yet, or None to go ahead.
+
+    An unpriceable request (cost_usd is None) is never blocked; the ledger
+    cannot speak to a model it has no price for.
+    """
+    if cost_usd is None:
+        return None
+
+    wait = wait_seconds_until_affordable(
+        cost_usd=cost_usd, entries=entries, limit_usd=limit_usd, now=now,
+    )
+    if wait == 0:
+        return None
+
+    if wait is None:
+        return (
+            f"this request costs ${cost_usd:.2f}, which alone exceeds the "
+            f"${limit_usd:.2f} limit; waiting will not help. Pass "
+            f"--force-spend to send it anyway."
+        )
+
+    spent = sum(entry["usd"] for entry in entries)
+    window_minutes = SPEND_WINDOW_SECONDS // 60
+    return (
+        f"this request costs ${cost_usd:.2f}; ${spent:.2f} already spent in "
+        f"the last {window_minutes} minutes against a ${limit_usd:.2f} limit. "
+        f"Wait {format_wait(wait)}, or pass --force-spend to send it anyway."
+    )
+
+
 def is_transient_error(exc: BaseException) -> bool:
     """Whether a failed request is worth retrying.
 
