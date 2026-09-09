@@ -691,14 +691,30 @@ def test_record_spend_appends_to_existing_entries(tmp_path):
     assert amounts == [pytest.approx(3.20), pytest.approx(0.40)]
 
 
-def test_record_spend_prunes_entries_that_have_aged_out(tmp_path):
+def test_record_spend_prunes_entries_from_before_today(tmp_path):
+    # The ledger is retained to the last Pacific midnight, not to the spend
+    # window, because the daily request count needs the whole day.
     ledger = tmp_path / ".spend_ledger.json"
-    generate_video.record_spend(ledger, usd=3.20, model="veo-3.1", now=1000.0)
+    generate_video.record_spend(ledger, usd=3.20, model="veo-3.1",
+                                now=1788850500.0)  # 2026-09-07 23:55 PDT
 
-    generate_video.record_spend(ledger, usd=0.40, model="veo-3.1", now=1700.0)
+    generate_video.record_spend(ledger, usd=0.40, model="veo-3.1",
+                                now=1788921420.0)  # 2026-09-08 19:37 PDT
 
     amounts = [e["usd"] for e in generate_video.read_ledger(ledger)]
     assert amounts == [pytest.approx(0.40)]
+
+
+def test_record_spend_keeps_entries_from_earlier_today(tmp_path):
+    ledger = tmp_path / ".spend_ledger.json"
+    generate_video.record_spend(ledger, usd=3.20, model="veo-3.1",
+                                now=1788850800.0 + 3600)  # 01:00 PDT
+
+    generate_video.record_spend(ledger, usd=0.40, model="veo-3.1",
+                                now=1788921420.0)         # 19:37 PDT, same day
+
+    amounts = [e["usd"] for e in generate_video.read_ledger(ledger)]
+    assert amounts == [pytest.approx(3.20), pytest.approx(0.40)]
 
 
 def test_record_spend_leaves_no_temporary_file_behind(tmp_path):
@@ -816,7 +832,7 @@ def test_spend_preflight_error_describes_the_cost_the_spend_and_the_wait():
 
     assert message == (
         "this request costs $3.20; $9.60 already spent in the last 10 "
-        "minutes against a $10.00 limit. Wait 6m12s, or pass --force-spend "
+        "minutes against a $10.00 limit. Wait 6m12s, or pass --force "
         "to send it anyway."
     )
 
@@ -827,7 +843,8 @@ def test_spend_preflight_error_says_waiting_cannot_help_when_the_cost_exceeds_th
     )
 
     assert "waiting will not help" in message
-    assert "--force-spend" in message
+    assert "Pass --force to send it anyway." in message
+    assert "--force-spend" not in message
 
 
 # --- is_daily_quota_error --------------------------------------------------
@@ -928,3 +945,160 @@ def test_stop_after_transient_attempts_stops_when_there_is_no_outcome():
     state.outcome = None
 
     assert generate_video.stop_after_transient_attempts(state) is False
+
+
+# --- format_wait, multi-hour waits -----------------------------------------
+
+def test_format_wait_renders_hours_and_minutes():
+    assert generate_video.format_wait(22320) == "6h12m"
+
+
+def test_format_wait_omits_seconds_once_it_reaches_an_hour():
+    assert generate_video.format_wait(3600) == "1h0m"
+
+
+def test_format_wait_still_renders_minutes_and_seconds_under_an_hour():
+    assert generate_video.format_wait(3599) == "59m59s"
+
+
+# --- quota_day_start -------------------------------------------------------
+
+# Fixtures are real epoch seconds in America/Los_Angeles (PDT, UTC-7):
+#   1788921420 = 2026-09-08 19:37
+#   1788850800 = 2026-09-08 00:00  <- that day's start
+#   1788851100 = 2026-09-08 00:05
+#   1788850500 = 2026-09-07 23:55
+#   1788764400 = 2026-09-07 00:00
+
+def test_quota_day_start_returns_the_most_recent_pacific_midnight():
+    assert generate_video.quota_day_start(1788921420.0) == 1788850800.0
+
+
+def test_quota_day_start_just_after_midnight_returns_that_midnight():
+    assert generate_video.quota_day_start(1788851100.0) == 1788850800.0
+
+
+def test_quota_day_start_just_before_midnight_returns_the_previous_day():
+    assert generate_video.quota_day_start(1788850500.0) == 1788764400.0
+
+
+# --- resolve_daily_request_limit -------------------------------------------
+
+def test_resolve_daily_request_limit_defaults_to_ten():
+    assert generate_video.resolve_daily_request_limit(None) == 10
+
+
+def test_resolve_daily_request_limit_reads_the_environment_override():
+    assert generate_video.resolve_daily_request_limit("50") == 50
+
+
+def test_resolve_daily_request_limit_ignores_a_blank_value():
+    assert generate_video.resolve_daily_request_limit("  ") == 10
+
+
+def test_resolve_daily_request_limit_rejects_a_non_numeric_value():
+    with pytest.raises(ValueError, match="VEO_DAILY_REQUEST_LIMIT"):
+        generate_video.resolve_daily_request_limit("ten")
+
+
+def test_resolve_daily_request_limit_rejects_a_non_positive_value():
+    with pytest.raises(ValueError, match="VEO_DAILY_REQUEST_LIMIT"):
+        generate_video.resolve_daily_request_limit("0")
+
+
+# --- count_requests_since --------------------------------------------------
+
+def test_count_requests_since_counts_entries_on_or_after_the_boundary():
+    entries = [
+        {"timestamp": 1788850500.0, "usd": 3.20},   # yesterday, 23:55
+        {"timestamp": 1788850800.0, "usd": 3.20},   # exactly midnight
+        {"timestamp": 1788851100.0, "usd": 3.20},   # today, 00:05
+    ]
+
+    assert generate_video.count_requests_since(entries, since=1788850800.0) == 2
+
+
+def test_count_requests_since_is_zero_for_an_empty_ledger():
+    assert generate_video.count_requests_since([], since=1788850800.0) == 0
+
+
+# --- prune_for_retention ---------------------------------------------------
+
+def test_prune_for_retention_keeps_entries_from_earlier_today():
+    # 06:00 Pacific, hours older than the spend window but still today.
+    entries = [{"timestamp": 1788850800.0 + 6 * 3600, "usd": 3.20}]
+
+    assert generate_video.prune_for_retention(entries, now=1788921420.0) == entries
+
+
+def test_prune_for_retention_keeps_an_entry_exactly_at_midnight():
+    # count_requests_since counts the boundary as today, so retention must
+    # keep it — otherwise the first request of the day is never counted.
+    entries = [{"timestamp": 1788850800.0, "usd": 3.20}]
+
+    assert generate_video.prune_for_retention(entries, now=1788921420.0) == entries
+
+
+def test_prune_for_retention_drops_entries_from_before_today():
+    entries = [{"timestamp": 1788850500.0, "usd": 3.20}]
+
+    assert generate_video.prune_for_retention(entries, now=1788921420.0) == []
+
+
+def test_prune_for_retention_keeps_yesterdays_entry_still_inside_the_spend_window():
+    # 00:02 Pacific: the 10-minute spend window reaches back past midnight, so
+    # an entry from 23:55 yesterday still counts against spend and must survive.
+    now = 1788850800.0 + 120
+    entries = [{"timestamp": 1788850500.0, "usd": 3.20}]
+
+    assert generate_video.prune_for_retention(entries, now=now) == entries
+
+
+# --- daily_quota_error -----------------------------------------------------
+
+def today_entries(count):
+    """`count` requests spread through today, well inside the retention window."""
+    return [{"timestamp": 1788850800.0 + 3600 + i, "usd": 3.20}
+            for i in range(count)]
+
+
+def test_daily_quota_error_is_none_with_requests_to_spare():
+    assert generate_video.daily_quota_error(
+        entries=today_entries(3), limit_requests=10, now=1788921420.0,
+    ) is None
+
+
+def test_daily_quota_error_is_none_on_the_last_available_request():
+    assert generate_video.daily_quota_error(
+        entries=today_entries(9), limit_requests=10, now=1788921420.0,
+    ) is None
+
+
+def test_daily_quota_error_blocks_once_the_limit_is_reached():
+    message = generate_video.daily_quota_error(
+        entries=today_entries(10), limit_requests=10, now=1788921420.0,
+    )
+
+    assert message == (
+        "10 of 10 requests used today; the daily quota resets at midnight "
+        "Pacific, in 4h23m. Pass --force to send it anyway."
+    )
+
+
+def test_daily_quota_error_ignores_entries_from_before_today():
+    entries = [{"timestamp": 1788850500.0, "usd": 3.20} for _ in range(20)]
+
+    assert generate_video.daily_quota_error(
+        entries=entries, limit_requests=10, now=1788921420.0,
+    ) is None
+
+
+def test_daily_quota_error_counts_a_request_made_exactly_at_midnight():
+    entries = generate_video.prune_for_retention(
+        [{"timestamp": 1788850800.0 + 60 * i, "usd": 3.20} for i in range(10)],
+        now=1788921420.0,
+    )
+
+    assert generate_video.daily_quota_error(
+        entries=entries, limit_requests=10, now=1788921420.0,
+    ) is not None

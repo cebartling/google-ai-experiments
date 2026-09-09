@@ -29,7 +29,7 @@ before any request is made.
 Every generation is billed, so use `--dry-run` while you are still working out
 the flags. `--dry-run` also prints what the request would cost.
 
-### The spend guard
+### The quota guards
 
 The Gemini API enforces a **spend-based rate limit over a rolling 10-minute
 window** — $10 on Tier 1 — and returns a bare `429 RESOURCE_EXHAUSTED` when you
@@ -37,28 +37,43 @@ cross it, with no `RetryInfo` and no endpoint to ask how much headroom is left.
 At $0.40/second for Veo 3.1 Standard, three 8-second clips ($9.60) is enough to
 trip it, which is easy to do: a seamless loop takes two generations.
 
+There is a second, blunter limit too: **10 Veo requests per day** on Tier 1,
+resetting at midnight Pacific. In practice this is the one that bites — ten
+8-second clips is an ordinary afternoon, and a seamless loop costs two of them.
+
 So the script keeps its own books. A request's cost is deterministic before it
-is sent — model x resolution x duration — so each charge is appended to
-`.spend_ledger.json` (gitignored, beside the script) and the next request is
-refused if it would cross the cap:
+is sent — model x resolution x duration — so each request is appended to
+`.spend_ledger.json` (gitignored, beside the script), and the next one is
+refused if it would cross either limit:
 
 ```
+Error: 10 of 10 requests used today; the daily quota resets at midnight
+Pacific, in 4h18m. Pass --force to send it anyway.
+
 Error: this request costs $3.20; $9.60 already spent in the last 10 minutes
-against a $10.00 limit. Wait 6m12s, or pass --force-spend to send it anyway.
+against a $10.00 limit. Wait 6m12s, or pass --force to send it anyway.
 ```
+
+The daily quota is checked first, since it is the one that cannot be waited out
+in minutes.
 
 Worth knowing:
 
-- **The cap defaults to $10.00.** The API will not say which tier a key is on,
-  so the script assumes Tier 1. Set `VEO_SPEND_LIMIT_USD` in `.env.local` to
-  raise it ($50 on Tier 2, $200 on Tier 3).
+- **Both caps assume Tier 1**, since the API will not say which tier a key is
+  on: $10.00 and 10 requests/day. Override either in `.env.local` with
+  `VEO_SPEND_LIMIT_USD` ($50 on Tier 2, $200 on Tier 3) or
+  `VEO_DAILY_REQUEST_LIMIT`. Your real numbers are on the
+  [AI Studio rate-limit page](https://aistudio.google.com/rate-limit), which is
+  the only place they are visible — the API exposes no way to query them.
 - **A model with no published price is never blocked.** `--model` takes an
   arbitrary string; an unrecognised one prints a note and the request goes out.
+- **A model with no published price still counts against the daily quota.**
+  Only the spend check needs a price; the request count does not.
 - **The ledger is advisory, not authoritative.** It records what this script
-  spent — generations from AI Studio or another machine are invisible to it,
-  and entries are written when a request is accepted, so a generation that
-  Veo's safety filters block afterwards is counted but not charged. Both errors
-  age out within 10 minutes.
+  did — generations from AI Studio or another machine are invisible to it, and
+  entries are written when a request is *accepted*, so one that Veo's safety
+  filters block afterwards is counted but not charged. Entries are kept until
+  the next Pacific midnight, so the daily count has the whole day to work with.
 - **A corrupt or unwritable ledger never blocks a run.** Delete it to reset:
   `rm .spend_ledger.json`.
 
@@ -121,7 +136,7 @@ a per-minute limit, cheap enough to be wrong about.
 | `--person-generation` | `dont_allow`, `allow_adult`, `allow_all` |
 | `--aspect-ratio`, `--resolution` | `16:9`/`9:16`, `720p`/`1080p`/`4k` |
 | `--dry-run` | Print the resolved request and exit; no API call |
-| `--force-spend` | Send the request even if it would cross the spend limit |
+| `--force` | Send the request even if it would cross the spend limit or daily quota |
 | `--model` | Veo model ID (default `veo-3.1-generate-preview`) |
 | `--output` | Where to write the `.mp4` (default `output.mp4`) |
 | `--poll-seconds` | Seconds between status checks (default 10) |
