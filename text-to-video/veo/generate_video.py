@@ -48,6 +48,7 @@ See README.md for the full flag list and the constraints the API enforces.
 """
 
 import argparse
+import datetime
 import json
 import math
 import os
@@ -56,6 +57,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import NamedTuple
 
 from dotenv import load_dotenv
@@ -435,6 +437,9 @@ def format_wait(seconds: float) -> str:
     Distinct from format_seconds, which formats filtergraph timestamps.
     """
     total = max(1, math.ceil(seconds))
+    if total >= 3600:
+        hours, remainder = divmod(total, 3600)
+        return f"{hours}h{remainder // 60}m"
     minutes, remainder = divmod(total, 60)
     return f"{minutes}m{remainder}s" if minutes else f"{remainder}s"
 
@@ -447,6 +452,14 @@ SPEND_WINDOW_SECONDS = 600
 DEFAULT_SPEND_LIMIT_USD = 10.00
 SPEND_LIMIT_ENV_VAR = "VEO_SPEND_LIMIT_USD"
 LEDGER_FILE = Path(__file__).resolve().parent / ".spend_ledger.json"
+
+# Separately from spend, Veo caps requests per day — 10 on Tier 1 — and that
+# quota resets at midnight Pacific rather than rolling. It is the limit far
+# more likely to bite: ten 8-second clips is a normal afternoon, and a seamless
+# loop costs two of them.
+DEFAULT_DAILY_REQUEST_LIMIT = 10
+DAILY_REQUEST_LIMIT_ENV_VAR = "VEO_DAILY_REQUEST_LIMIT"
+QUOTA_RESET_ZONE = ZoneInfo("America/Los_Angeles")
 
 
 def resolve_spend_limit_usd(raw: str | None) -> float:
@@ -504,7 +517,7 @@ def record_spend(path: Path, *, usd: float, model: str, now: float) -> None:
     leaves the previous ledger rather than a truncated one. Write failures are
     swallowed: the generation is already under way and paid for.
     """
-    entries = prune_entries(read_ledger(path), now=now)
+    entries = prune_for_retention(read_ledger(path), now=now)
     entries.append({"timestamp": now, "usd": usd, "model": model})
 
     temp_path = path.with_suffix(path.suffix + ".tmp")
@@ -563,7 +576,7 @@ def spend_preflight_error(*, cost_usd: float | None, entries: list[dict],
         return (
             f"this request costs ${cost_usd:.2f}, which alone exceeds the "
             f"${limit_usd:.2f} limit; waiting will not help. Pass "
-            f"--force-spend to send it anyway."
+            f"--force to send it anyway."
         )
 
     spent = sum(entry["usd"] for entry in entries)
@@ -571,7 +584,7 @@ def spend_preflight_error(*, cost_usd: float | None, entries: list[dict],
     return (
         f"this request costs ${cost_usd:.2f}; ${spent:.2f} already spent in "
         f"the last {window_minutes} minutes against a ${limit_usd:.2f} limit. "
-        f"Wait {format_wait(wait)}, or pass --force-spend to send it anyway."
+        f"Wait {format_wait(wait)}, or pass --force to send it anyway."
     )
 
 
@@ -583,6 +596,69 @@ def spend_preflight_error(*, cost_usd: float | None, entries: list[dict],
 # budget chasing a limit no amount of waiting will lift.
 MAX_ATTEMPTS = 5
 MAX_RATE_LIMIT_ATTEMPTS = 2
+
+
+def quota_day_start(now: float) -> float:
+    """The most recent midnight Pacific, when the daily quota last reset."""
+    local = datetime.datetime.fromtimestamp(now, QUOTA_RESET_ZONE)
+    start = datetime.datetime.combine(local.date(), datetime.time.min,
+                                      tzinfo=QUOTA_RESET_ZONE)
+    return start.timestamp()
+
+
+def resolve_daily_request_limit(raw: str | None) -> int:
+    """The per-day request cap, from the environment or default."""
+    if raw is None or not raw.strip():
+        return DEFAULT_DAILY_REQUEST_LIMIT
+    try:
+        limit = int(raw)
+    except ValueError:
+        limit = 0
+    if limit <= 0:
+        raise ValueError(
+            f"{DAILY_REQUEST_LIMIT_ENV_VAR} must be a positive whole number "
+            f"of requests, got {raw!r}."
+        )
+    return limit
+
+
+def count_requests_since(entries: list[dict], *, since: float) -> int:
+    """How many requests the ledger records at or after a boundary."""
+    return sum(1 for entry in entries if entry["timestamp"] >= since)
+
+
+def prune_for_retention(entries: list[dict], *, now: float) -> list[dict]:
+    """The entries still needed by either check.
+
+    Wider than prune_entries: the daily count needs everything back to the last
+    Pacific midnight, which is usually far older than the spend window. Just
+    after midnight the reverse holds and the spend window reaches back further,
+    so an entry is kept when either check could still want it. The boundaries
+    differ in strictness — midnight itself belongs to today, while an entry
+    exactly at the spend window's edge has expired — so this tests both rather
+    than taking the older cutoff.
+    """
+    day_start = quota_day_start(now)
+    spend_cutoff = now - SPEND_WINDOW_SECONDS
+    return [entry for entry in entries
+            if entry["timestamp"] >= day_start
+            or entry["timestamp"] > spend_cutoff]
+
+
+def daily_quota_error(*, entries: list[dict], limit_requests: int,
+                       now: float) -> str | None:
+    """Why this request should not be sent today, or None to go ahead."""
+    day_start = quota_day_start(now)
+    used = count_requests_since(entries, since=day_start)
+    if used < limit_requests:
+        return None
+
+    reset_in = day_start + 86400 - now
+    return (
+        f"{used} of {limit_requests} requests used today; the daily quota "
+        f"resets at midnight Pacific, in {format_wait(reset_in)}. "
+        f"Pass --force to send it anyway."
+    )
 
 
 def is_daily_quota_error(exc: BaseException) -> bool:
@@ -746,9 +822,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                          help="Print the resolved request and exit without "
                               "calling the API")
-    parser.add_argument("--force-spend", action="store_true",
+    parser.add_argument("--force", action="store_true",
                          help="Send the request even if it would cross the "
-                              "rolling spend limit")
+                              "spend limit or the daily request quota")
     args = parser.parse_args()
 
     try:
@@ -825,15 +901,25 @@ def main():
     if cost_usd is None:
         print(f"Skipping the spend check: no published price for "
               f"{args.model}.", file=sys.stderr)
-    elif not args.force_spend:
+
+    if not args.force:
         try:
             limit_usd = resolve_spend_limit_usd(os.environ.get(SPEND_LIMIT_ENV_VAR))
+            limit_requests = resolve_daily_request_limit(
+                os.environ.get(DAILY_REQUEST_LIMIT_ENV_VAR))
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-        message = spend_preflight_error(
+
+        retained = prune_for_retention(read_ledger(LEDGER_FILE), now=now)
+
+        # The daily quota is checked first: it is the one that cannot be waited
+        # out in minutes, so it is the more useful thing to be told about.
+        message = daily_quota_error(
+            entries=retained, limit_requests=limit_requests, now=now,
+        ) or spend_preflight_error(
             cost_usd=cost_usd,
-            entries=prune_entries(read_ledger(LEDGER_FILE), now=now),
+            entries=prune_entries(retained, now=now),
             limit_usd=limit_usd,
             now=now,
         )
