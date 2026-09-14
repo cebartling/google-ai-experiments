@@ -235,10 +235,12 @@ def validate_crossfade(*, crossfade: float | None, loop: bool,
         raise ValueError(
             f"--crossfade must be greater than zero, got {crossfade}."
         )
-    if crossfade >= duration:
+    # The tail dissolves over the first duration - crossfade seconds, so a
+    # fade of half the clip or more leaves no head to blend into.
+    if crossfade >= duration / 2:
         raise ValueError(
-            f"--crossfade must be shorter than the clip; got {crossfade} for "
-            f"a {duration}s clip."
+            f"--crossfade must be shorter than half the clip; got {crossfade} "
+            f"for a {duration}s clip."
         )
 
 
@@ -342,7 +344,10 @@ def apply_crossfade(path: str, *, clip_seconds: float,
         command += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
     command += [
         "-c:v", "libx264", "-crf", "16", "-preset", "slow",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(target),
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        # Named explicitly: an extensionless --output leaves ffmpeg nothing
+        # to infer the format from.
+        "-f", "mp4", str(target),
     ]
 
     try:
@@ -849,6 +854,12 @@ def main():
             duration=args.duration,
             resolution=args.resolution,
         )
+        # Checked up front: saving only happens after the video is paid for.
+        output_dir = Path(args.output).resolve().parent
+        if not output_dir.is_dir():
+            raise FileNotFoundError(
+                f"Output directory does not exist: {output_dir}"
+            )
     except (ValueError, FileNotFoundError) as e:
         parser.error(str(e))
 
@@ -932,9 +943,9 @@ def main():
     print(f"Starting generation with {args.model}...", file=sys.stderr)
     try:
         operation = start_generation(client, prompt, args.model, config, image)
-        if cost_usd is not None:
-            record_spend(LEDGER_FILE, usd=cost_usd, model=args.model,
-                         now=time.time())
+        # Recorded even when unpriced: the daily quota counts ledger entries.
+        record_spend(LEDGER_FILE, usd=cost_usd or 0.0, model=args.model,
+                     now=time.time())
     except Exception as e:
         print(f"Failed to start generation: {e}", file=sys.stderr)
         sys.exit(1)

@@ -403,8 +403,19 @@ def test_validate_crossfade_rejects_a_non_positive_fade():
 
 
 def test_validate_crossfade_rejects_a_fade_as_long_as_the_clip():
-    with pytest.raises(ValueError, match="shorter than the clip"):
+    with pytest.raises(ValueError, match="shorter than half the clip"):
         generate_video.validate_crossfade(crossfade=8, loop=True, duration=8)
+
+
+def test_validate_crossfade_rejects_a_fade_of_half_the_clip():
+    # The head the tail dissolves over is the first duration - fade seconds,
+    # so a fade of half the clip or more leaves nothing to blend into.
+    with pytest.raises(ValueError, match="shorter than half the clip"):
+        generate_video.validate_crossfade(crossfade=4, loop=True, duration=8)
+
+
+def test_validate_crossfade_accepts_a_fade_just_under_half_the_clip():
+    generate_video.validate_crossfade(crossfade=3.9, loop=True, duration=8)
 
 
 # --- build_crossfade_filter ------------------------------------------------
@@ -497,6 +508,29 @@ def test_apply_crossfade_raises_when_ffmpeg_fails(tmp_path, monkeypatch):
 
     # The original clip survives a failed fade.
     assert clip.read_bytes() == b"original"
+
+
+def test_apply_crossfade_names_the_container_for_an_extensionless_output(
+        tmp_path, monkeypatch):
+    clip = tmp_path / "clip"
+    clip.write_bytes(b"original")
+    monkeypatch.setattr(generate_video.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(generate_video, "has_audio_stream", lambda path: False)
+
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"crossfaded")
+        return generate_video.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(generate_video.subprocess, "run", fake_run)
+
+    generate_video.apply_crossfade(str(clip), clip_seconds=8, fade_seconds=0.5)
+
+    # ffmpeg cannot infer a format from "clip.crossfade", so it must be named.
+    assert commands[0][-3:-1] == ["-f", "mp4"]
+    assert clip.read_bytes() == b"crossfaded"
 
 
 # --- estimate_cost_usd -----------------------------------------------------
@@ -1102,3 +1136,55 @@ def test_daily_quota_error_counts_a_request_made_exactly_at_midnight():
     assert generate_video.daily_quota_error(
         entries=entries, limit_requests=10, now=1788921420.0,
     ) is not None
+
+
+# --- main ------------------------------------------------------------------
+
+
+def run_main(tmp_path, monkeypatch, argv):
+    """Run main() against stubbed API calls; return the generation calls."""
+    env_file = tmp_path / ".env.local"
+    env_file.write_text("GEMINI_API_KEY=test-key-123\n")
+    monkeypatch.setattr(generate_video, "ENV_FILE", env_file)
+    monkeypatch.setattr(generate_video, "LEDGER_FILE", tmp_path / "ledger.json")
+    monkeypatch.setattr(generate_video, "build_client", lambda: object())
+
+    started = []
+
+    def fake_start(*args, **kwargs):
+        started.append(args)
+        return "operation"
+
+    monkeypatch.setattr(generate_video, "start_generation", fake_start)
+    monkeypatch.setattr(generate_video, "poll_until_done",
+                        lambda client, operation, **kwargs: operation)
+    monkeypatch.setattr(generate_video, "save_videos",
+                        lambda client, operation, output: [output])
+    monkeypatch.setattr(sys, "argv", ["generate_video.py", *argv])
+
+    generate_video.main()
+    return started
+
+
+def test_main_rejects_an_output_directory_that_does_not_exist(tmp_path, monkeypatch):
+    started = []
+    output = tmp_path / "missing" / "clip.mp4"
+
+    with pytest.raises(SystemExit):
+        started = run_main(tmp_path, monkeypatch,
+                           ["a prompt", "--output", str(output)])
+
+    # Refused before any paid request goes out.
+    assert started == []
+
+
+def test_main_counts_an_unpriced_request_toward_the_daily_quota(tmp_path, monkeypatch):
+    run_main(tmp_path, monkeypatch, [
+        "a prompt", "--model", "veo-2.0-generate-001",
+        "--output", str(tmp_path / "clip.mp4"),
+    ])
+
+    entries = generate_video.read_ledger(tmp_path / "ledger.json")
+    assert len(entries) == 1
+    assert entries[0]["usd"] == 0
+    assert entries[0]["model"] == "veo-2.0-generate-001"
